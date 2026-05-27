@@ -116,6 +116,7 @@ class _SessionTracker:
         self.session_id = f"auto-{_dt.now().strftime('%Y-%m-%dT%H-%M-%S')}"
         self.start_time = _dt.now()
         self.tool_name: str = ""        # detected connecting tool
+        self.client_info: dict[str, str] = {}  # MCP clientInfo from initialize
         self.project_folder: str = ""   # detected project path
         self.calls: list[dict[str, str]] = []
         self.saved = False
@@ -231,6 +232,36 @@ class _SessionTracker:
         if not self.tool_name and tool:
             self.tool_name = tool
 
+    def detect_client_info(self, name: str, version: str = "") -> None:
+        """Record the MCP clientInfo from the initialize handshake.
+
+        Called once from the first tool invocation that has access to
+        the FastMCP context.  Sets ``tool_name`` as a side-effect when
+        the AI tool hasn't been detected yet (e.g. short sessions that
+        never call save_agent_context).
+        """
+        if self.client_info:
+            return  # already detected
+        self.client_info = {"name": name, "version": version}
+        logger.info("MCP client: %s %s", name, version)
+        # Auto-map well-known MCP client names to our tool_name taxonomy
+        # so session tracking works even if the AI never calls
+        # save_agent_context(tool=...).
+        _CLIENT_NAME_MAP = {
+            "claude-code": "claude_code",
+            "claude-desktop": "claude_desktop",
+            "claude": "claude_desktop",  # older Claude Desktop builds
+            "cursor": "cursor",
+            "codex": "codex",
+            "windsurf": "windsurf",
+            "cline": "cline",
+            "roo-code": "roo_code",
+            "copilot": "copilot_vscode",
+            "amazon-q": "amazon_q",
+        }
+        mapped = _CLIENT_NAME_MAP.get(name.lower(), name.lower().replace("-", "_"))
+        self.detect_tool(mapped)
+
     def detect_project(self, folder: str) -> None:
         if not self.project_folder and folder:
             self.project_folder = folder
@@ -263,12 +294,18 @@ class _SessionTracker:
         for c in self.calls:
             seen.setdefault(c["tool_called"], None)
 
+        client_label = (
+            f"{self.client_info['name']} {self.client_info.get('version', '')}"
+            if self.client_info else ""
+        )
         content = (
             f"[中间检查点 #{self._checkpoint_seq}] 触发: {reason} · "
             f"会话时长: {duration} 分钟\n"
             f"工具调用次数: {len(self.calls)}\n"
             f"使用的工具: {', '.join(seen.keys())}\n"
         )
+        if client_label:
+            content += f"MCP 客户端: {client_label}\n"
         actions = [
             {
                 "tool_called": c["tool_called"],
@@ -328,11 +365,17 @@ class _SessionTracker:
             seen.setdefault(c["tool_called"], None)
         unique_tools = list(seen.keys())
 
+        client_label = (
+            f"{self.client_info['name']} {self.client_info.get('version', '')}"
+            if self.client_info else ""
+        )
         content = (
             f"[MCP 自动记录] 会话时长: {duration} 分钟\n"
             f"工具调用次数: {len(self.calls)}\n"
             f"使用的工具: {', '.join(unique_tools)}\n"
         )
+        if client_label:
+            content += f"MCP 客户端: {client_label}\n"
 
         # Keep last 50 actions to prevent oversized files
         actions = [
@@ -469,6 +512,28 @@ import atexit
 atexit.register(_engram_clean_shutdown)
 
 
+def _detect_mcp_client_once() -> None:
+    """Extract clientInfo from the MCP session on the first tool call.
+
+    Called from ``_track`` so every tool handler automatically triggers
+    it — no need to add ``ctx`` parameters to individual tools.
+    Safe to call outside a request context (returns silently).
+    """
+    if _session.client_info:
+        return  # already detected
+    try:
+        ctx = mcp.get_context()
+        session = ctx.session
+        params = session.client_params
+        if params and params.clientInfo:
+            _session.detect_client_info(
+                params.clientInfo.name,
+                params.clientInfo.version,
+            )
+    except Exception:
+        pass  # not in a request context, or client didn't send info
+
+
 def _track(tool_name: str, success: bool = True, args_summary: str = "") -> None:
     """Record a tool call for telemetry and session auto-tracking.
 
@@ -476,6 +541,7 @@ def _track(tool_name: str, success: bool = True, args_summary: str = "") -> None
     MCP server process is killed without a clean wrap_up_session.
     """
     global _track_count
+    _detect_mcp_client_once()
     if _tracker is not None:
         _tracker.record(tool_name, success=success)
         _track_count += 1

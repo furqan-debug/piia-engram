@@ -983,12 +983,27 @@ def _write_mcp_config(
     if removed:
         print(f"  [migrated] removed legacy server(s): {', '.join(removed)}")
 
+    # Always use `-m piia_engram.mcp_server` (module invocation).
+    # Direct .py paths fail with "ImportError: attempted relative import
+    # with no known parent package" in all clients that spawn a subprocess.
+    env: dict[str, str] = {"PYTHONIOENCODING": "utf-8", "ENGRAM_TOOLS": "all"}
+
+    # If piia_engram is NOT importable from the default sys.path (e.g.
+    # editable install via a different Python, or manual source checkout),
+    # inject PYTHONPATH so `-m` can still resolve the package.
+    spec = importlib.util.find_spec("piia_engram")
+    if not spec and mcp_server_path:
+        src_dir = str(Path(mcp_server_path).parent.parent)
+        env["PYTHONPATH"] = src_dir
+
+    if data_dir:
+        env["ENGRAM_DIR"] = data_dir
+
     entry: dict = {
         "command": python_path,
-        "args": [mcp_server_path],
+        "args": ["-m", "piia_engram.mcp_server"],
+        "env": env,
     }
-    if data_dir:
-        entry["env"] = {"ENGRAM_DIR": data_dir}
 
     config["mcpServers"]["engram"] = entry
 
@@ -1980,14 +1995,22 @@ def _validate_engram_entry(servers: dict, config_path: Path) -> list[str]:
 
     # 2. 服务端脚本/模块路径
     args = engram.get("args") or []
+    uses_module_invocation = "-m" in args
     for arg in args:
         if arg.startswith("-"):
             # -m module.name — 不是文件路径，跳过
             continue
         p = Path(arg.replace("\\\\", "\\"))
         # 只验证看起来像路径的参数（含 / 或 \ 或 .py）
-        if ("/" in arg or "\\" in arg or arg.endswith(".py")) and not p.is_file():
-            issues.append(f"脚本路径不存在: {arg}")
+        if ("/" in arg or "\\" in arg or arg.endswith(".py")):
+            if not p.is_file():
+                issues.append(f"脚本路径不存在: {arg}")
+            if not uses_module_invocation and arg.endswith(".py"):
+                # Direct .py invocation causes ImportError on relative imports.
+                issues.append(
+                    f"使用直接 .py 路径调用 '{arg}'，会导致 ImportError。"
+                    f"应改为 args: [\"-m\", \"piia_engram.mcp_server\"]"
+                )
 
     # 3. 检查 -m 模块调用是否指向旧模块名
     for i, arg in enumerate(args):

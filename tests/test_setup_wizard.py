@@ -50,15 +50,20 @@ def test_find_mcp_server():
 
 
 def test_write_mcp_config_creates_file(tmp_path: Path):
-    """_write_mcp_config 应在新路径创建配置文件。"""
+    """_write_mcp_config 应在新路径创建配置文件，使用 -m 模块调用。"""
     config_path = tmp_path / "test_mcp.json"
     _write_mcp_config(config_path, "/usr/bin/python3", "/path/to/mcp_server.py")
     assert config_path.is_file()
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert "mcpServers" in config
     assert "engram" in config["mcpServers"]
-    assert config["mcpServers"]["engram"]["command"] == "/usr/bin/python3"
-    assert config["mcpServers"]["engram"]["args"] == ["/path/to/mcp_server.py"]
+    engram = config["mcpServers"]["engram"]
+    assert engram["command"] == "/usr/bin/python3"
+    # Must use -m module invocation, never direct .py path
+    assert engram["args"] == ["-m", "piia_engram.mcp_server"]
+    # Default env always includes PYTHONIOENCODING and ENGRAM_TOOLS
+    assert engram["env"]["PYTHONIOENCODING"] == "utf-8"
+    assert engram["env"]["ENGRAM_TOOLS"] == "all"
 
 
 def test_write_mcp_config_merges(tmp_path: Path):
@@ -75,7 +80,7 @@ def test_write_mcp_config_merges(tmp_path: Path):
 
 
 def test_write_mcp_config_with_data_dir(tmp_path: Path):
-    """设置自定义 ENGRAM_DIR 时应写入 env 字段。"""
+    """设置自定义 ENGRAM_DIR 时应额外写入 ENGRAM_DIR 到 env。"""
     config_path = tmp_path / "mcp.json"
     _write_mcp_config(
         config_path,
@@ -84,11 +89,15 @@ def test_write_mcp_config_with_data_dir(tmp_path: Path):
         data_dir="/custom/engram",
     )
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    assert config["mcpServers"]["engram"]["env"]["ENGRAM_DIR"] == "/custom/engram"
+    env = config["mcpServers"]["engram"]["env"]
+    assert env["ENGRAM_DIR"] == "/custom/engram"
+    # Default env keys should still be present
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["ENGRAM_TOOLS"] == "all"
 
 
-def test_write_mcp_config_no_env_without_data_dir(tmp_path: Path):
-    """data_dir 为 None 时不应写入 env 字段。"""
+def test_write_mcp_config_default_env_without_data_dir(tmp_path: Path):
+    """data_dir 为 None 时 env 仍应包含 PYTHONIOENCODING 和 ENGRAM_TOOLS。"""
     config_path = tmp_path / "mcp.json"
     _write_mcp_config(
         config_path,
@@ -97,7 +106,10 @@ def test_write_mcp_config_no_env_without_data_dir(tmp_path: Path):
         data_dir=None,
     )
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    assert "env" not in config["mcpServers"]["engram"]
+    env = config["mcpServers"]["engram"]["env"]
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["ENGRAM_TOOLS"] == "all"
+    assert "ENGRAM_DIR" not in env
 
 
 def test_write_mcp_config_overwrites_existing_engram(tmp_path: Path):
