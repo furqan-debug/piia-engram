@@ -100,7 +100,12 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
         )
 
         # Data fragmentation detection — warn, don't silently split.
-        self.data_orphans = detect_data_fragmentation(self.root)
+        # Skip in test environments (ENGRAM_TEST=1) to avoid noisy warnings
+        # when a temporary ENGRAM_DIR coexists with the real ~/.engram.
+        if os.environ.get("ENGRAM_TEST", "").strip().lower() in ("1", "true", "yes"):
+            self.data_orphans: list[str] = []
+        else:
+            self.data_orphans = detect_data_fragmentation(self.root)
         if self.data_orphans:
             logger.warning(
                 "DATA FRAGMENTATION: active root is %s but data also "
