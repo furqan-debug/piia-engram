@@ -1903,6 +1903,161 @@ class TestEngramHookCommandConstruction:
         second = _inject_claude_code_postcompact_hook(_sys.executable)
         assert second is None
 
+    def test_force_rewrite_upgrades_stale_script_path_hook(self, tmp_path, monkeypatch):
+        """v3.30.1 fix: doctor --fix must upgrade old script-path style PreCompact
+        hook to current ``python -m`` form, instead of silently skipping it."""
+        import sys as _sys
+        from piia_engram.setup_wizard import _inject_claude_code_precompact_hook
+
+        monkeypatch.setattr("piia_engram.setup_wizard.Path.home", lambda: tmp_path)
+        (tmp_path / ".claude").mkdir()
+
+        # Pre-populate settings.json with a v3.29-style stale hook that
+        # references a .py script path (not python -m module form). Its
+        # command contains the env marker ``CLAUDE_INVOKED_BY=engram_precompact``
+        # so legacy idempotent skip considers it "present", but doctor's
+        # strict-match check fails (no ``piia_engram.hooks.auto_save_on_stop``
+        # substring) — exactly the v3.30 dogfooding bug we're fixing.
+        stale_cmd = (
+            "ENGRAM_MIN_TURNS_TO_FLUSH=5 CLAUDE_INVOKED_BY=engram_precompact "
+            "/usr/bin/python /opt/engram/scripts/auto_save_on_stop.py"
+        )
+        existing = {
+            "hooks": {
+                "PreCompact": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": stale_cmd,
+                                "timeout": 30,
+                                "async": True,
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        (tmp_path / ".claude" / "settings.json").write_text(
+            json.dumps(existing), encoding="utf-8"
+        )
+
+        # Without force_rewrite — backward-compatible: skip (returns None)
+        result_skip = _inject_claude_code_precompact_hook(_sys.executable)
+        assert result_skip is None, \
+            "default behaviour must remain idempotent skip"
+
+        # Confirm settings.json was NOT modified (stale command still there)
+        settings_after_skip = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+        assert settings_after_skip["hooks"]["PreCompact"][0]["hooks"][0]["command"] \
+            == stale_cmd
+
+        # With force_rewrite=True — should upgrade in place
+        result_fix = _inject_claude_code_precompact_hook(
+            _sys.executable, force_rewrite=True,
+        )
+        assert result_fix is not None, "force_rewrite must overwrite stale hook"
+
+        settings_after_fix = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+        new_cmd = settings_after_fix["hooks"]["PreCompact"][0]["hooks"][0]["command"]
+        assert "piia_engram.hooks.auto_save_on_stop" in new_cmd, \
+            "rewritten hook must use python -m module form"
+        assert "scripts/auto_save_on_stop.py" not in new_cmd, \
+            "stale .py script path must be gone"
+        # Env marker must survive in the rewritten command
+        assert "CLAUDE_INVOKED_BY=engram_precompact" in new_cmd
+
+    def test_force_rewrite_noop_when_already_current(self, tmp_path, monkeypatch):
+        """force_rewrite shouldn't re-touch settings.json when the hook is
+        already at the current spec — that would dirty the file for nothing
+        and confuse anyone looking at mtime."""
+        import sys as _sys
+        from piia_engram.setup_wizard import _inject_claude_code_postcompact_hook
+
+        monkeypatch.setattr("piia_engram.setup_wizard.Path.home", lambda: tmp_path)
+        (tmp_path / ".claude").mkdir()
+
+        # First call: fresh install
+        first = _inject_claude_code_postcompact_hook(_sys.executable)
+        assert first is not None
+
+        settings_path = tmp_path / ".claude" / "settings.json"
+        mtime_before = settings_path.stat().st_mtime_ns
+
+        # Second call with force_rewrite=True but nothing actually
+        # changed — should return None ("no rewrite needed") and not
+        # touch the file.
+        second = _inject_claude_code_postcompact_hook(
+            _sys.executable, force_rewrite=True,
+        )
+        assert second is None, \
+            "force_rewrite on an up-to-date hook should be a no-op"
+
+        # File mtime should be unchanged
+        assert settings_path.stat().st_mtime_ns == mtime_before, \
+            "settings.json must not be touched when hook is already current"
+
+    def test_force_rewrite_preserves_other_event_hooks(self, tmp_path, monkeypatch):
+        """Rewriting Engram's own hook in PreCompact must not affect
+        unrelated user-added hooks (e.g. Stop, SessionStart, or even a
+        different hook in the same event)."""
+        import sys as _sys
+        from piia_engram.setup_wizard import _inject_claude_code_precompact_hook
+
+        monkeypatch.setattr("piia_engram.setup_wizard.Path.home", lambda: tmp_path)
+        (tmp_path / ".claude").mkdir()
+
+        # User has a custom Stop hook + a stale Engram PreCompact + a user
+        # PreCompact hook unrelated to Engram. After force_rewrite, only
+        # the Engram PreCompact should be replaced.
+        existing = {
+            "hooks": {
+                "Stop": [{"hooks": [
+                    {"type": "command", "command": "echo my-stop-hook"}
+                ]}],
+                "PreCompact": [{"hooks": [
+                    {"type": "command", "command": "echo unrelated-precompact"},
+                    {
+                        "type": "command",
+                        "command": (
+                            "CLAUDE_INVOKED_BY=engram_precompact "
+                            "/old/python /old/auto_save_on_stop.py"
+                        ),
+                        "timeout": 30,
+                    },
+                ]}],
+            }
+        }
+        (tmp_path / ".claude" / "settings.json").write_text(
+            json.dumps(existing), encoding="utf-8"
+        )
+
+        result = _inject_claude_code_precompact_hook(
+            _sys.executable, force_rewrite=True,
+        )
+        assert result is not None
+
+        after = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+
+        # Stop hook untouched
+        assert after["hooks"]["Stop"][0]["hooks"][0]["command"] == "echo my-stop-hook"
+
+        # PreCompact group: unrelated hook still there, Engram hook upgraded
+        pre_hooks = after["hooks"]["PreCompact"][0]["hooks"]
+        assert len(pre_hooks) == 2
+        unrelated = [h for h in pre_hooks if "unrelated-precompact" in h["command"]]
+        engram = [h for h in pre_hooks if "CLAUDE_INVOKED_BY=engram_precompact" in h["command"]]
+        assert len(unrelated) == 1, "user's unrelated hook must survive"
+        assert len(engram) == 1, "Engram hook must remain (just upgraded)"
+        assert "piia_engram.hooks.auto_save_on_stop" in engram[0]["command"], \
+            "Engram hook must now use -m form"
+
 
 # ---------------------------------------------------------------------------
 # _build_feedback_report

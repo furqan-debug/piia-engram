@@ -4,6 +4,24 @@ All notable changes to Engram are documented in this file. For detailed release 
 
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [3.30.1] - 2026-05-27
+
+修复 `engram doctor --fix` 对过期 hook 无法升级的问题。
+
+### Fixed
+
+- `engram doctor --fix` 现在能正确升级旧版 Claude Code hook 配置（例如指向 `scripts/*.py` 脚本路径的旧风格升级到 `python -m piia_engram.hooks.*` 的当前形式）。之前 doctor 的严格匹配检查报"缺失"，但 `--fix` 的幂等跳过逻辑却认为"已注册"而 skip — 导致用户卡在"doctor 说缺、--fix 修不了"的循环。
+- Hook 注册器新增 `force_rewrite` 参数：默认 `False` 保持向后兼容的幂等行为；`doctor --fix` 显式传 `True` 以覆盖匹配但内容过期的 hook。同事件下不相关的用户自定义 hook 不受影响。
+
+### Changed
+
+- `doctor --fix` 输出从 "Could not register" 改为更准确的 "already up to date"（当 hook 完全符合当前 spec 时）。
+
+### Release Evidence
+
+- 全量 pytest：933/933 通过（新增 3 个 force_rewrite 测试覆盖：stale 升级、no-op 不写盘、共存 hook 不被误删）。
+- dogfooding 自验证：本机过期 PreCompact hook（旧 `.py` 脚本路径）被 `doctor --fix` 自动升级为 `-m` 形式。
+
 ## [3.30.0] - 2026-05-27
 
 跨会话 / 跨工具续接 + 崩溃恢复机制全套上线。

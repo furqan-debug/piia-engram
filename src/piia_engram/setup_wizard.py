@@ -598,12 +598,12 @@ def _inject_claude_code_hook_for_event(
     extra_env: dict[str, str] | None = None,
     marker_keywords: tuple[str, ...] = ("piia_engram",),
     async_hook: bool = True,
+    force_rewrite: bool = False,
 ) -> str | None:
     """Register a per-event hook in ``~/.claude/settings.json``.
 
-    Generic core used by Stop / PreCompact / SessionStart wiring (v3.30).
-    Idempotent — skips if any hook matching ``marker_keywords`` already
-    appears in the event group.
+    Generic core used by Stop / PreCompact / SessionStart / PostCompact
+    wiring.
 
     Args:
         python_path: Absolute path to the python interpreter to invoke.
@@ -613,11 +613,24 @@ def _inject_claude_code_hook_for_event(
         timeout: Hook timeout in seconds.
         extra_env: Extra env hints; transported as ``--env KEY=VAL`` argv.
         marker_keywords: Strings used to detect "already registered".
-        async_hook: ``True`` for fire-and-forget Stop / PreCompact;
-            ``False`` for SessionStart, where ``additionalContext`` must
-            be written before the first user turn is processed.
+        async_hook: ``True`` for fire-and-forget Stop / PreCompact /
+            PostCompact; ``False`` for SessionStart, where
+            ``additionalContext`` must be written before the first user
+            turn is processed.
+        force_rewrite: If ``False`` (default), skip when any existing hook
+            matches ``marker_keywords`` — backward-compatible idempotent
+            behaviour, preserves any user-customised hook. If ``True``,
+            *replace* the matching hook's ``command`` (and timeout /
+            statusMessage / async) with the freshly built one, so doctor
+            ``--fix`` can upgrade stale hooks left behind by older
+            versions (e.g. script-path style → ``python -m`` style, or
+            hooks whose env markers no longer satisfy the current
+            doctor's strict-match check).
 
-    Returns the settings path on success, None on failure / already-present.
+    Returns:
+        Path to the settings file on success (either newly added or
+        rewritten); ``None`` if a matching hook already existed and
+        ``force_rewrite`` is False, or on failure.
     """
     try:
         settings_path = Path.home() / ".claude" / "settings.json"
@@ -633,31 +646,57 @@ def _inject_claude_code_hook_for_event(
         hooks = settings.setdefault("hooks", {})
         event_groups = hooks.setdefault(event, [])
 
-        # Idempotency: skip if any group already has a hook matching markers.
+        # Look for a matching existing hook.
+        existing_hook: dict | None = None
         for event_group in event_groups:
             for hook in event_group.get("hooks", []):
                 cmd = hook.get("command", "")
                 if any(kw in cmd for kw in marker_keywords):
-                    logger.info(
-                        "Engram %s hook already registered (marker %s found)",
-                        event,
-                        next(kw for kw in marker_keywords if kw in cmd),
-                    )
-                    return None  # Already registered
+                    existing_hook = hook
+                    break
+            if existing_hook is not None:
+                break
 
-        engram_hook: dict = {
-            "type": "command",
-            "command": engram_command,
-            "timeout": timeout,
-            "statusMessage": status_message,
-        }
-        if async_hook:
-            engram_hook["async"] = True
+        if existing_hook is not None:
+            if not force_rewrite:
+                logger.info(
+                    "Engram %s hook already registered (matched marker)", event,
+                )
+                return None  # Already registered, no rewrite requested
 
-        if event_groups:
-            event_groups[0].setdefault("hooks", []).append(engram_hook)
+            # Rewrite in place: update the command (and refresh metadata)
+            # so doctor --fix can upgrade old hooks left behind by earlier
+            # Engram versions.
+            existing_cmd = existing_hook.get("command", "")
+            if existing_cmd == engram_command:
+                logger.info(
+                    "Engram %s hook already up to date (no rewrite needed)",
+                    event,
+                )
+                return None  # Same command — nothing to do
+            existing_hook["command"] = engram_command
+            existing_hook["timeout"] = timeout
+            existing_hook["statusMessage"] = status_message
+            if async_hook:
+                existing_hook["async"] = True
+            else:
+                existing_hook.pop("async", None)
+            logger.info("Engram %s hook rewritten in place", event)
         else:
-            event_groups.append({"hooks": [engram_hook]})
+            # No matching hook — append fresh.
+            engram_hook: dict = {
+                "type": "command",
+                "command": engram_command,
+                "timeout": timeout,
+                "statusMessage": status_message,
+            }
+            if async_hook:
+                engram_hook["async"] = True
+
+            if event_groups:
+                event_groups[0].setdefault("hooks", []).append(engram_hook)
+            else:
+                event_groups.append({"hooks": [engram_hook]})
 
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(
@@ -673,13 +712,14 @@ def _inject_claude_code_hook_for_event(
         return None
 
 
-def _inject_claude_code_hook(python_path: str) -> str | None:
+def _inject_claude_code_hook(
+    python_path: str, *, force_rewrite: bool = False,
+) -> str | None:
     """Register Engram Stop hook in Claude Code settings.json.
 
-    Adds the auto_save_on_stop.py hook to Claude Code's Stop event.
-    Idempotent: skips if engram hook already registered.
-
-    Returns the settings path if injected, None otherwise.
+    Pass ``force_rewrite=True`` (used by ``doctor --fix``) to upgrade an
+    older hook in place; default keeps backward-compatible idempotent
+    skip behaviour.
     """
     return _inject_claude_code_hook_for_event(
         python_path,
@@ -689,21 +729,27 @@ def _inject_claude_code_hook(python_path: str) -> str | None:
         timeout=30,
         marker_keywords=("auto_save_on_stop", "piia_engram.hooks.auto_save_on_stop"),
         async_hook=True,
+        force_rewrite=force_rewrite,
     )
 
 
-def _inject_claude_code_precompact_hook(python_path: str) -> str | None:
-    """v3.30 mechanism (4): register PreCompact hook with asymmetric threshold.
+def _inject_claude_code_precompact_hook(
+    python_path: str, *, force_rewrite: bool = False,
+) -> str | None:
+    """v3.30: register PreCompact hook with asymmetric threshold.
 
-    Fires before Claude Code auto-compacts the transcript, calling the same
-    auto_save_on_stop.py script but with MIN_TURNS_TO_FLUSH=5 (vs 1 for the
-    Stop hook). Asymmetric thresholds prevent short sessions from triggering
-    a flush at every minor compaction while still protecting long sessions
-    from losing pre-compact state.
+    Fires before Claude Code auto-compacts the transcript, calling the
+    auto_save_on_stop module with MIN_TURNS_TO_FLUSH=5 (vs 10 for the
+    Stop hook). Asymmetric thresholds prevent short sessions from
+    triggering a flush at every minor compaction while still protecting
+    long sessions from losing pre-compact state.
 
-    Also sets ``CLAUDE_INVOKED_BY=engram_precompact`` so the script can
-    detect re-entry (the Claude Agent SDK inside the script would otherwise
-    re-fire SessionEnd/PreCompact in an infinite loop).
+    Sets ``CLAUDE_INVOKED_BY=engram_precompact`` so the script can
+    detect re-entry (the Claude Agent SDK inside the script would
+    otherwise re-fire SessionEnd/PreCompact in an infinite loop).
+
+    Pass ``force_rewrite=True`` to upgrade an old script-path style hook
+    to the current ``python -m`` form.
     """
     return _inject_claude_code_hook_for_event(
         python_path,
@@ -717,11 +763,14 @@ def _inject_claude_code_precompact_hook(python_path: str) -> str | None:
         },
         marker_keywords=("CLAUDE_INVOKED_BY=engram_precompact",),
         async_hook=True,
+        force_rewrite=force_rewrite,
     )
 
 
-def _inject_claude_code_sessionstart_hook(python_path: str) -> str | None:
-    """v3.30 mechanism (6): register SessionStart hook for resume_brief auto-inject.
+def _inject_claude_code_sessionstart_hook(
+    python_path: str, *, force_rewrite: bool = False,
+) -> str | None:
+    """v3.30: register SessionStart hook for resume_brief auto-inject.
 
     Fires when Claude Code starts a new session. The hook script calls
     ``mcp__engram__get_resume_brief`` and emits the result via the
@@ -746,13 +795,16 @@ def _inject_claude_code_sessionstart_hook(python_path: str) -> str | None:
         # ``hookSpecificOutput.additionalContext`` into the first user
         # turn if the hook returned before that turn was assembled.
         # Marking the hook async lets the first turn start before the
-        # brief is written, defeating the whole point of mechanism (6).
+        # brief is written, defeating the whole point of the mechanism.
         async_hook=False,
+        force_rewrite=force_rewrite,
     )
 
 
-def _inject_claude_code_postcompact_hook(python_path: str) -> str | None:
-    """v3.30 mechanism (R4): register PostCompact hook to absorb compact summary.
+def _inject_claude_code_postcompact_hook(
+    python_path: str, *, force_rewrite: bool = False,
+) -> str | None:
+    """v3.30: register PostCompact hook to absorb compact summary.
 
     Fires AFTER Claude Code compacts the transcript. The hook script
     reads the compacted transcript, extracts the AI-generated summary
@@ -760,9 +812,8 @@ def _inject_claude_code_postcompact_hook(python_path: str) -> str | None:
     "compact" event. Also feeds the summary into extract_session_insights
     for staging-tier auto-extraction.
 
-    This replaces the earlier agent-type PostCompact hook (PKC era) with
-    a lightweight command-type hook that doesn't spin up a full AI
-    conversation just to extract knowledge from a summary.
+    Lightweight command-type hook that doesn't spin up a full AI
+    conversation just to extract knowledge from the summary.
 
     Sets ``CLAUDE_INVOKED_BY=engram_postcompact`` for recursion guard.
     """
@@ -780,6 +831,7 @@ def _inject_claude_code_postcompact_hook(python_path: str) -> str | None:
             "piia_engram.hooks.auto_absorb_compact",
         ),
         async_hook=True,
+        force_rewrite=force_rewrite,
     )
 
 
@@ -2446,12 +2498,17 @@ def _run_functional_checks(*, fix: bool = False) -> int:
             if python_path_for_fix is None:
                 python_path_for_fix = _find_python() or ""
             if python_path_for_fix:
-                result = injector(python_path_for_fix)
+                # v3.30.1: pass force_rewrite=True so doctor --fix can
+                # upgrade stale hooks (e.g. script-path style → -m form,
+                # or hooks whose env markers no longer satisfy doctor's
+                # strict-match check). Without force_rewrite, idempotent
+                # skip would let "PreCompact present but stale" survive.
+                result = injector(python_path_for_fix, force_rewrite=True)
                 if result:
                     _safe_print(f"    [fixed] {label} hook registered: {result}")
                 else:
                     _safe_print(
-                        f"    [info] Could not register {label} hook"
+                        f"    [info] {label} hook already up to date"
                     )
             else:
                 _safe_print("    [info] Cannot fix: Python not found")
