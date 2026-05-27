@@ -2321,9 +2321,16 @@ async def doctor(output_format: str = "markdown") -> str:
     })
 
     # 4. Stale knowledge
+    # NOTE: get_knowledge_overview() returns {"digest", "health", "stale"} — the
+    # health-report payload (incl. items_needing_review / items_to_archive /
+    # health_score) is nested under "health", not at top-level. Earlier versions
+    # of doctor read overview["lifecycle"] / overview["health_score"] directly,
+    # which silently returned defaults and produced health_score=0 with empty
+    # stale/archive lists (regression flagged in v3.29.4, lesson 81d05b09c8ee).
     overview = _engram.get_knowledge_overview()
-    stale = overview.get("lifecycle", {}).get("items_needing_review", [])
-    archive = overview.get("lifecycle", {}).get("items_to_archive", [])
+    health_report = overview.get("health", {}) if isinstance(overview, dict) else {}
+    stale = health_report.get("items_needing_review", [])
+    archive = health_report.get("items_to_archive", [])
     checks.append({
         "name": "stale_knowledge",
         "status": "WARN" if len(stale) > 10 else "PASS",
@@ -2357,12 +2364,16 @@ async def doctor(output_format: str = "markdown") -> str:
         "detail": f"冲突决策: {len(conflicts)} 对" if conflicts else "无冲突",
     })
 
-    # 7. Health score
-    health = overview.get("health_score", 0)
+    # 7. Health score (also nested under overview["health"])
+    health = health_report.get("health_score", 0)
+    dimensions = health_report.get("dimensions", {})
+    dim_breakdown = (
+        " · ".join(f"{k}={v}" for k, v in dimensions.items()) if dimensions else ""
+    )
     checks.append({
         "name": "health_score",
         "status": "PASS" if health >= 70 else "WARN",
-        "detail": f"{health}/100",
+        "detail": f"{health}/100" + (f" ({dim_breakdown})" if dim_breakdown else ""),
     })
 
     # 8. Quick context freshness

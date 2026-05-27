@@ -108,3 +108,50 @@ def test_doctor_runs_without_error(tmp_path: Path):
     assert isinstance(overview, dict)
     # 关键字段存在
     assert "total" in overview or len(overview) > 0
+
+
+def test_doctor_reads_nested_health_fields(tmp_path: Path, monkeypatch):
+    """R4-1 (v3.29.4 post-release fix): doctor 必须从 overview["health"] 读取
+    health_score / items_needing_review / items_to_archive — 这些字段嵌套在
+    "health" 子对象下而非顶层。早期 doctor 错误地访问 overview["lifecycle"]
+    与 overview["health_score"]，导致即使存在 active 知识也报 health_score=0。
+
+    本测试覆盖回归路径：直接通过 mcp_server 模块的 doctor wrapper 调用，
+    验证 markdown 输出包含非零 health_score。
+    """
+    import asyncio
+    import json
+    from piia_engram import mcp_server
+
+    e = _make(tmp_path)
+    # 写入多 domain 知识让 coverage 维度非零
+    e.add_lesson("Python 异步错误处理实战", "python,async")
+    e.add_lesson("Git rebase 与 merge 的取舍", "git,workflow")
+    e.add_lesson("MCP stdio transport 调试", "mcp,debugging")
+    e.add_decision("HTTP 客户端选型", choice="httpx", domain="python")
+
+    # 用本地 Engram 替换模块级全局
+    monkeypatch.setattr(mcp_server, "_engram", e)
+
+    # JSON 输出便于断言
+    raw = asyncio.run(mcp_server.doctor(output_format="json"))
+    payload = json.loads(raw)
+
+    checks = {c["name"]: c for c in payload["checks"]}
+    health = checks["health_score"]
+
+    # 字段路径修对了 → 应该 > 0（实际 90+ 因为新建数据全 fresh）
+    detail = health["detail"]
+    score_str = detail.split("/")[0].strip()
+    score = int(score_str)
+    assert score > 0, (
+        f"FAIL: health_score=0 — doctor 未正确从 overview['health'] 读取数据。"
+        f" detail={detail!r}"
+    )
+    # detail 应该包含 4 维度细分
+    for dim in ("freshness", "quality", "coverage", "cleanliness"):
+        assert dim in detail, f"FAIL: dimension breakdown missing '{dim}'"
+
+    # stale_knowledge 不应因字段路径错误而虚假报 0
+    stale = checks["stale_knowledge"]
+    assert "需复审" in stale["detail"] and "可归档" in stale["detail"]
