@@ -1,0 +1,95 @@
+name: Guard strategic files
+
+# 防止战略性 / weakness-exposing 文件被误 commit 进仓库。
+# 触发条件：任何 push 或 PR 涉及到下方 BLOCKED_PATTERNS 列出的路径。
+# 失败时给出明确的修复指引（不只是 fail 一行）。
+#
+# 历史背景：v3.30 第二轮深度脱敏发现，之前 commit 过 milestone reviews、
+# design docs、telemetry roadmap、cross_ai eval reports —— 都是"暴露自己
+# 弱点 / 把设计思路全交底"的内容。文件层 + .gitignore 都加了规则，这个
+# CI workflow 是第三道闸：万一以后 .gitignore 写漏 / 有人 git add -f
+# 强加，这里会 hard-block。
+
+on:
+  push:
+    branches: [main, "codex/**", "pre-release/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Block strategic / weakness-exposing files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2  # need HEAD + parent for "changed files" diff
+
+      - name: Scan for blocked paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Patterns that should NEVER appear in the working tree.
+          # Each line is a basic git-pathspec or shell glob.
+          BLOCKED=(
+            # Competitive intelligence
+            "experiments/competitive_landscape*.md"
+            "experiments/beta_recruitment*.md"
+            # Marketing strategy
+            "docs/messaging.md"
+            "docs/vision.md"
+            # Roadmap detail (short-term roadmap can live in CHANGELOG/README)
+            "docs/telemetry_roadmap.md"
+            # Design rationale that's our edge
+            "docs/playbook-auto-extraction-design.md"
+            "docs/design/"
+            # Self-assessed weakness audits
+            "docs/milestone_review_*.md"
+            "docs/milestone_review_*.html"
+            # Cross-AI evaluation reports with weakness analysis
+            "experiments/evaluations/v*/cross_ai/"
+            # Internal drafts
+            "docs/_drafts/"
+            # Private strategy backup (defensive — should never be inside repo
+            # anyway, but catch if someone accidentally syncs it in)
+            "engram-private-strategy/"
+          )
+
+          hits=()
+          for pat in "${BLOCKED[@]}"; do
+            # Use git ls-files to check tracked files only.
+            # -z + xargs handles spaces in paths defensively.
+            while IFS= read -r f; do
+              [ -n "$f" ] && hits+=("$f")
+            done < <(git ls-files -- "$pat" 2>/dev/null || true)
+          done
+
+          if [ "${#hits[@]}" -eq 0 ]; then
+            echo "[ok] no strategic files committed."
+            exit 0
+          fi
+
+          echo "::error::Found ${#hits[@]} blocked file(s) committed to the repo:"
+          for f in "${hits[@]}"; do
+            echo "  - $f"
+          done
+          echo ""
+          echo "These files expose strategic/competitive material that should"
+          echo "stay private. See docs/release-playbook.md §2 for the four-layer"
+          echo "sanitization model and §2.3 for safe-language conventions."
+          echo ""
+          echo "Fix:"
+          echo "  1. Move the file to your local private notes (outside the repo)"
+          echo "  2. git rm <file>"
+          echo "  3. Confirm .gitignore covers the pattern"
+          echo "  4. Re-push"
+          echo ""
+          echo "If a NEW pattern needs to be added to this guard, edit"
+          echo ".github/workflows/guard-strategic-files.yml (the BLOCKED array)."
+          exit 1
