@@ -62,3 +62,9 @@ worker/.wrangler/
 
 # Internal-only doc drafts (not for publishing)
 docs/_drafts/
+
+# Competitive intelligence & internal strategy (never publish)
+experiments/competitive_landscape*.md
+experiments/beta_recruitment*.md
+docs/messaging.md
+docs/vision.md

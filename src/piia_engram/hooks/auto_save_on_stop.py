@@ -61,8 +61,7 @@ def main() -> None:
     # Re-entry guard. The Claude Agent SDK invocation we trigger below
     # can itself fire SessionEnd/PreCompact in a child process, which
     # would loop infinitely. ``CLAUDE_INVOKED_BY=engram_*`` is set by the
-    # parent hook command (and by flush.py in the claude-memory-compiler
-    # design we borrowed this pattern from).
+    # parent hook command to break the recursion cycle.
     if os.environ.get("CLAUDE_INVOKED_BY", "").startswith("engram_"):
         if os.environ.get("CLAUDE_INVOKED_BY") == "engram_recursive":
             return

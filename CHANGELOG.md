@@ -38,7 +38,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [3.29.0] - 2026-05-24
 
-AI instruction auto-injection, hooks adapter, activation funnel, competitive scan.
+AI instruction auto-injection, hooks adapter, activation funnel, comparison docs.
 
 ### Added
 - **AI instruction auto-injection**: `engram setup` now injects instruction snippets into each tool's native config file (`CLAUDE.md`, `.cursorrules`/`.mdc`, `AGENTS.md`) so AI proactively calls Engram without relying solely on MCP server instructions
@@ -50,7 +50,7 @@ AI instruction auto-injection, hooks adapter, activation funnel, competitive sca
 - Issue template chooser config (`.github/ISSUE_TEMPLATE/config.yml`) with Discussions and Security links
 - `setup_report.jsonl` — local setup result tracking for activation funnel analysis
 - 20 new tests: instruction injection (10), setup report (6), hook registration (4)
-- 37-project competitive landscape scan (`experiments/competitive_landscape_2026Q2.md`)
+- `docs/comparison.md` rewritten with 3-category competitive positioning
 
 ### Changed
 - MCP server instructions rewritten: structured "WHEN TO CALL" format with 5 explicit trigger points

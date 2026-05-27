@@ -2,7 +2,7 @@
 
 This page is a **factual** comparison of where Engram sits in the AI-memory space. It is **not** a marketing pitch — we link to each project's own docs and call out where they're stronger than us.
 
-> Last reviewed: 2026-05-24, based on a [37-project competitive scan](../experiments/competitive_landscape_2026Q2.md). We re-check this each minor release. If you spot an inaccuracy, please open an issue.
+> Last reviewed: 2026-05-27. We re-check this each minor release. If you spot an inaccuracy, please open an issue.
 
 ---
 
@@ -160,5 +160,4 @@ You could absolutely run **Engram + Letta + Mem0** together: Engram for who you 
 
 - [README](../README.md) — what Engram is and how to install
 - [architecture.md](architecture.md) — internal structure of Engram itself
-- [competitive_landscape_2026Q2.md](../experiments/competitive_landscape_2026Q2.md) — full 37-project competitive scan with data cards
 - [milestone_review_v3.13.2.md](milestone_review_v3.13.2.md) — external AI audit that drove the v3.14.x positioning work
