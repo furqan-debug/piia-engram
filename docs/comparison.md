@@ -8,7 +8,7 @@ This page is a **factual** comparison of where Engram sits in the AI-memory spac
 
 ## The space, in one sentence
 
-Most "AI memory" tools store **what the agent did**. Engram stores **who the user is** — identity, preferences, quality standards, and lessons that survive across every tool the user ever uses. AI proposes knowledge; you approve what becomes permanent.
+A common approach to "AI memory" is to store **what the agent did**. Engram takes the other angle: it stores **who the user is** — identity, preferences, quality standards, and lessons that survive across every tool the user ever uses. AI proposes knowledge; you approve what becomes permanent.
 
 If you only need a single agent to remember its own conversations, you don't need Engram. If you want your identity to follow you from Claude Code to Cursor to Codex without re-training each one, Engram is built for that.
 
@@ -60,7 +60,7 @@ Tools that store the **user's** identity, preferences, and accumulated knowledge
 
 | Project | Stars | Storage | Governance | Unique angle |
 |---|---|---|---|---|
-| **piia-engram** | 80 | Local JSON | **staging → verified** (user approves) | Identity layer: lessons, decisions, playbooks |
+| **piia-engram** | (this project) | Local JSON | **staging → verified** (user approves) | Identity layer: lessons, decisions, playbooks |
 | [Gentleman Engram](https://github.com/Gentleman-Programming/engram) | 3.7k | SQLite + FTS5 | None | Go single binary, 8+ tools |
 | [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) | 1.8k | SQLite / vector / KG | Weak | 14+ client support |
 | [ByteRover](https://github.com/campfirein/byterover-cli) | 4.7k | Portable memory layer | Weak | "Portable memory layer" narrative |
@@ -69,7 +69,7 @@ Tools that store the **user's** identity, preferences, and accumulated knowledge
 
 *\* monorepo star count; individual memory server is one of many packages*
 
-**This is where piia-engram lives.** Among the projects we've surveyed, piia-engram is the only one using staging → verified as the *default* governance model. The closest approaches are Remnic (provenance/correction) and Vestige (contradiction/audit).
+**This is where piia-engram lives.** Among the projects we've surveyed, piia-engram is the one using **staging → verified** as the default governance model — knowledge proposed by the AI lands in a review tier and only becomes permanent after the user approves it. The closest approach among surveyed projects is Remnic, which adds provenance and correction primitives on top of an otherwise auto-capture model.
 
 ---
 
@@ -119,19 +119,19 @@ We believe in honest positioning. Here's where other tools beat us today:
 
 | Area | Who does it better | Why |
 |---|---|---|
-| **Installation simplicity** | Gentleman Engram, Vestige, remindb | Single binary / `brew install`. piia-engram requires `pip install` + MCP config |
-| **Auto-capture via hooks** | MemPalace, claude-memory-compiler, ClawMem | Hooks bypass "AI forgets to call the tool" problem. piia-engram uses instruction injection (v3.29.0+) |
-| **Semantic retrieval** | Mem0, Graphiti, agentmemory | Vector DB + embeddings. piia-engram uses n-gram search (fast, offline, but less "smart") |
-| **Benchmark narrative** | MemPalace (96.6%), Mem0 (94.8%) | LongMemEval scores. piia-engram focuses on governance metrics, not recall benchmarks |
-| **Visual experience** | Vestige (3D dashboard), Nocturne (rollback UI) | piia-engram has CLI + HTML review page |
-| **Ecosystem scale** | Mem0 (742k weekly downloads), Graphiti (146k) | piia-engram has ~4k weekly downloads |
+| **Installation simplicity** | Single-binary projects (Go / Rust) | Single binary / `brew install` is one command. piia-engram requires `pip install` + MCP config (also one-time, but two steps). |
+| **Auto-capture via hooks** | Projects with native shell-hook integrations | Hooks bypass the "AI forgets to call the tool" problem. piia-engram now uses Claude Code Stop / PreCompact / SessionStart / PostCompact hooks for the same goal, plus instruction injection into config files for tools without hook APIs. |
+| **Semantic retrieval** | Vector-DB-based memory tools | Vector DB + embeddings tend to score higher on benchmark recall. piia-engram uses character n-gram + alias tokenization — deterministic, offline, CJK-friendly, and well-suited for the small-store regime (≤500 items). |
+| **Benchmark narrative** | Projects publishing LongMemEval scores | piia-engram focuses on **governance metrics** (precision of user-approved knowledge, conflict rate, stale-decay accuracy) rather than recall benchmarks, because the use case is "right thing surfaced" not "everything indexed". |
+| **Visual experience** | Projects with dedicated dashboards | piia-engram has a CLI + a generated HTML review page. A dedicated GUI is not currently on the roadmap. |
+| **Ecosystem scale** | Mainstream memory frameworks | piia-engram is a smaller, focused project. Larger ecosystems have more integrations, plugins, and community tooling. |
 
 ---
 
 ## What Engram explicitly does *not* do
 
 - **No vector embeddings.** We use character n-gram + alias tokenization for similarity. This is fast, deterministic, works offline, handles CJK well, and is appropriate for the small-store regime (200–500 items). It would be the wrong choice at 100,000 items — don't use Engram for that.
-- **No cloud storage in core.** There is no Engram Cloud, no managed instance. **Usage statistics are off by default** — users must explicitly opt in during `engram setup`. When enabled, only anonymous aggregated counts are sent (tool call counts, knowledge totals, engram version); no identity content, prompts, file paths, or IP addresses are ever transmitted. The only other network call from the core library is `read_web_content` (optional, requires the local Engram Reader sidecar). MCP transport itself is stdio or self-hosted HTTP.
+- **No cloud storage in core.** There is no Engram Cloud, no managed instance. **Usage statistics are off by default** — users must explicitly opt in during `engram setup`. When enabled, only anonymous aggregated counts (tool names + call counts, knowledge totals, engram version) are written to a local log at `~/.engram/telemetry.log`. No network requests are made by the current implementation. No identity content, prompts, file paths, or IP addresses are ever recorded. The only other network call from the core library is `read_web_content` (optional, requires the local Engram Reader sidecar). MCP transport itself is stdio or self-hosted HTTP.
 - **No automatic "agent self-edits the memory."** The agent can call `add_lesson` / `add_decision` / `extract_session_insights`, but new items land in the `staging` tier. They only become `verified` when the user explicitly promotes them via the review page. This is a deliberate choice against the failure mode where an agent hallucinates a "remembered fact."
 - **No team / multi-user model.** Engram is one person × many tools. If you need many people × many tools, you want something else.
 
