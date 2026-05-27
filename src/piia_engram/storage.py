@@ -316,7 +316,22 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
 
 
+_NO_PROJECT_LITERAL = "(no-project)"
+
+
 def _project_id(folder: str) -> str:
-    """Stable short hash for a project folder path."""
-    normalized = str(Path(folder).resolve()).replace("\\", "/").lower()
+    """Stable short hash for a project folder path.
+
+    v3.30 M3 fix: empty / whitespace-only folder maps to a fixed
+    ``(no-project)`` literal *before* hashing. The old behaviour passed
+    an empty string through ``Path("").resolve()``, which returns the
+    current working directory — meaning two tools (Claude Code in
+    project A's cwd, Codex in project B's cwd) ended up with different
+    "no-project" hashes and couldn't see each other's spillover logs.
+    """
+    raw = (folder or "").strip()
+    if not raw:
+        normalized = _NO_PROJECT_LITERAL
+    else:
+        normalized = str(Path(raw).resolve()).replace("\\", "/").lower()
     return hashlib.sha256(normalized.encode()).hexdigest()[:12]

@@ -1740,6 +1740,109 @@ class TestInjectClaudeCodeHook:
 
 
 # ---------------------------------------------------------------------------
+# v3.30 H1+H2+H3 — hook command construction and SessionStart sync.
+# ---------------------------------------------------------------------------
+
+
+class TestEngramHookCommandConstruction:
+    """Hook command builder and event registration (v3.30)."""
+
+    def test_hook_command_uses_python_dash_m_module_form(self):
+        """No more script-path quoting: hooks ride ``python -m`` so the
+        wheel can ship them inside the package (H1)."""
+        from piia_engram.setup_wizard import (
+            _build_engram_hook_command, _HOOK_MODULES,
+        )
+        cmd = _build_engram_hook_command(
+            r"C:\Python312\python.exe",
+            module=_HOOK_MODULES["auto_save_on_stop"],
+        )
+        assert "-m" in cmd
+        assert "piia_engram.hooks.auto_save_on_stop" in cmd
+        # Script-path style must not leak through.
+        assert "auto_save_on_stop.py" not in cmd
+
+    def test_hook_command_quotes_python_path_with_spaces(self):
+        """H2: the Windows ``Program Files`` path must survive shell
+        parsing as a single argument."""
+        from piia_engram.setup_wizard import (
+            _build_engram_hook_command, _HOOK_MODULES,
+        )
+        cmd = _build_engram_hook_command(
+            r"C:\Program Files\Python312\python.exe",
+            module=_HOOK_MODULES["auto_save_on_stop"],
+        )
+        assert cmd.startswith('"C:\\Program Files\\Python312\\python.exe"')
+        # Critically NOT the legacy double-escaped form.
+        assert "\\\\Program" not in cmd
+
+    def test_hook_command_carries_env_via_argv(self):
+        """H2: env hints must travel as ``--env KEY=VAL`` argv so they
+        work identically on Windows cmd, PowerShell, and POSIX shells
+        (the legacy inline ``KEY=VAL prog`` prefix doesn't work on
+        Windows)."""
+        from piia_engram.setup_wizard import (
+            _build_engram_hook_command, _HOOK_MODULES,
+        )
+        cmd = _build_engram_hook_command(
+            "/usr/bin/python3",
+            module=_HOOK_MODULES["auto_save_on_stop"],
+            extra_env={
+                "ENGRAM_MIN_TURNS_TO_FLUSH": "5",
+                "CLAUDE_INVOKED_BY": "engram_precompact",
+            },
+        )
+        assert "--env" in cmd
+        assert '"ENGRAM_MIN_TURNS_TO_FLUSH=5"' in cmd
+        assert '"CLAUDE_INVOKED_BY=engram_precompact"' in cmd
+        # No POSIX-only inline env prefix.
+        assert not cmd.startswith("ENGRAM_MIN_TURNS")
+
+    def test_sessionstart_hook_registered_synchronously(self, tmp_path, monkeypatch):
+        """H3: SessionStart must be a synchronous hook — otherwise the
+        first user turn ships before the resume brief is written and
+        mechanism (6) silently degrades."""
+        import sys as _sys
+        from piia_engram.setup_wizard import (
+            _inject_claude_code_sessionstart_hook,
+        )
+        monkeypatch.setattr("piia_engram.setup_wizard.Path.home", lambda: tmp_path)
+        (tmp_path / ".claude").mkdir()
+
+        result = _inject_claude_code_sessionstart_hook(_sys.executable)
+        assert result is not None
+
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+        hooks = settings["hooks"]["SessionStart"][0]["hooks"]
+        engram_hook = [
+            h for h in hooks
+            if "piia_engram.hooks.auto_inject_resume_brief" in h.get("command", "")
+        ]
+        assert len(engram_hook) == 1
+        # Either no async key or async=False; never async=True for
+        # SessionStart (that's the H3 bug).
+        assert engram_hook[0].get("async") is not True, (
+            "SessionStart hook is marked async — additionalContext "
+            "may not land before the first user turn"
+        )
+
+    def test_stop_hook_registered_async(self, tmp_path, monkeypatch):
+        """Counterpart to test_sessionstart: Stop is fire-and-forget."""
+        import sys as _sys
+        monkeypatch.setattr("piia_engram.setup_wizard.Path.home", lambda: tmp_path)
+        (tmp_path / ".claude").mkdir()
+        result = _inject_claude_code_hook(_sys.executable)
+        assert result is not None
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+        hook = settings["hooks"]["Stop"][0]["hooks"][0]
+        assert hook.get("async") is True
+
+
+# ---------------------------------------------------------------------------
 # _build_feedback_report
 # ---------------------------------------------------------------------------
 

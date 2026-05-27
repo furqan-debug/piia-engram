@@ -116,94 +116,114 @@ def test_heartbeat_fires_checkpoint_on_idle_session_with_activity(
     monkeypatch, tmp_path: Path
 ):
     """The headline guarantee: if there are unsaved tool calls and the
-    interval elapses, _interim_save runs without record() being called
-    20 more times. This is what protects against crash-mid-idle-session."""
-    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="1")
+    interval elapses, ``_interim_save`` runs without record() being
+    called 20 more times. This is what protects against crash-mid-idle.
+
+    v3.30 H6 fix: drive a single deterministic ``_heartbeat_tick``
+    instead of sleeping past a wall-clock interval — that prior pattern
+    was flaky on Windows CI when disk IO or GIL scheduling pushed the
+    daemon thread past the assert.
+    """
+    # interval=0 keeps the background daemon thread out of the way so
+    # the test can drive _heartbeat_tick() directly with no races.
+    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="0")
     try:
         # Record only 2 real tool calls — far below _CHECKPOINT_EVERY=20.
         tracker.record("add_lesson", "lesson 1")
         tracker.record("add_decision", "decision 1")
         assert tracker._checkpoint_seq == 0  # no checkpoint yet
 
-        # Wait > 2 intervals. The heartbeat thread should have fired at
-        # least one checkpoint by now (1s interval, 2.5s wait).
-        time.sleep(2.5)
-
+        fired = tracker._heartbeat_tick()
+        assert fired is True
         assert tracker._checkpoint_seq >= 1, (
-            "Heartbeat must trigger _interim_save even when call count "
-            "is below _CHECKPOINT_EVERY"
+            "Heartbeat tick must trigger _interim_save even when call "
+            "count is below _CHECKPOINT_EVERY"
         )
 
         # The checkpoint file should exist on disk under contexts/.
         ctx_dir = tmp_path / "contexts" / "mcp_auto"
         assert ctx_dir.is_dir()
         cp_files = list(ctx_dir.glob("*-cp*.md"))
-        assert cp_files, f"Expected checkpoint .md file, found: {list(ctx_dir.iterdir())}"
+        assert cp_files, (
+            f"Expected checkpoint .md file, found: {list(ctx_dir.iterdir())}"
+        )
         body = cp_files[0].read_text(encoding="utf-8")
         assert "触发: heartbeat" in body, (
-            "Checkpoint header must tag the trigger reason so audits can "
-            "distinguish heartbeat vs count vs manual saves"
+            "Checkpoint header must tag the trigger reason so audits "
+            "can distinguish heartbeat vs count vs manual saves"
         )
     finally:
         _shutdown(tracker)
 
 
 def test_heartbeat_skips_when_no_activity(monkeypatch, tmp_path: Path):
-    """An empty session must NOT spam checkpoints. We waste IO otherwise."""
-    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="1")
+    """An empty session must NOT spam checkpoints."""
+    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="0")
     try:
-        time.sleep(2.5)  # >2 intervals elapse with no activity
+        fired = tracker._heartbeat_tick()
+        assert fired is False
         assert tracker._checkpoint_seq == 0
     finally:
         _shutdown(tracker)
 
 
 def test_heartbeat_skips_when_already_saved(monkeypatch, tmp_path: Path):
-    """After a record-triggered checkpoint, the next heartbeat tick should
-    NOT fire another save unless there's new activity. Otherwise long
-    sessions would get a checkpoint every interval, doubling the work."""
-    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="1")
+    """After a record-triggered checkpoint, the next heartbeat tick
+    must NOT fire another save unless there's new activity."""
+    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="0")
     try:
         tracker.record("add_lesson", "lesson 1")
         tracker.record("add_decision", "decision 1")
-        # Manual save to set _last_save_at = now
         tracker._interim_save()
         seq_after_manual = tracker._checkpoint_seq
         assert seq_after_manual >= 1
 
-        # No new record() — heartbeat should be a no-op for at least one tick.
-        time.sleep(1.5)
+        # No new record() — heartbeat tick should be a no-op.
+        fired = tracker._heartbeat_tick()
+        assert fired is False
         assert tracker._checkpoint_seq == seq_after_manual
     finally:
         _shutdown(tracker)
 
 
 def test_heartbeat_resumes_after_new_activity(monkeypatch, tmp_path: Path):
-    """After a quiet period, a new record() should cause the next heartbeat
-    tick to fire again. (Catches: 'thread misreads _last_save_at and never
-    fires again' bug.)
-
-    Uses 2s sleeps (vs 1s interval) to give the thread enough margin for
-    startup latency + GIL scheduling + disk write on slow Windows runners.
-    """
-    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="1")
+    """After a quiet period, a new record() must cause the next
+    heartbeat tick to fire again. (Catches: 'thread misreads
+    _last_save_at and never fires again' bug.)"""
+    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="0")
     try:
         tracker.record("add_lesson", "first")
-        time.sleep(2.0)
+        assert tracker._heartbeat_tick() is True
         first_seq = tracker._checkpoint_seq
-        assert first_seq >= 1, (
-            f"Expected at least one heartbeat checkpoint after 2s with 1s "
-            f"interval, but _checkpoint_seq={first_seq}. Heartbeat thread "
-            f"may not have fired."
-        )
+        assert first_seq >= 1
 
-        # New activity 2s later. Heartbeat should fire again within ~1s.
+        # Idle tick: no new record() → must be a no-op.
+        assert tracker._heartbeat_tick() is False
+        assert tracker._checkpoint_seq == first_seq
+
+        # New activity — next tick fires again.
         tracker.record("add_decision", "second")
-        time.sleep(2.0)
-        assert tracker._checkpoint_seq > first_seq, (
-            f"Heartbeat should fire again after new record() activity, but "
-            f"_checkpoint_seq stayed at {first_seq}"
-        )
+        assert tracker._heartbeat_tick() is True
+        assert tracker._checkpoint_seq > first_seq
+    finally:
+        _shutdown(tracker)
+
+
+def test_heartbeat_tick_only_writes_when_owner_lock_acquired(
+    monkeypatch, tmp_path: Path
+):
+    """``_heartbeat_tick`` is the unit the loop calls — pin the contract
+    that it returns ``True`` only when it actually wrote a checkpoint
+    (used by H6 refactor and by future failure-handling work)."""
+    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="0")
+    try:
+        # Empty session → no-op.
+        assert tracker._heartbeat_tick() is False
+
+        tracker.record("add_lesson", "x")
+        assert tracker._heartbeat_tick() is True
+        # Subsequent tick with no new activity is a no-op.
+        assert tracker._heartbeat_tick() is False
     finally:
         _shutdown(tracker)
 
@@ -266,5 +286,85 @@ def test_auto_save_stops_the_heartbeat_thread(monkeypatch, tmp_path: Path):
         if tracker._heartbeat_thread is not None:
             tracker._heartbeat_thread.join(timeout=2.0)
             assert not tracker._heartbeat_thread.is_alive()
+    finally:
+        _shutdown(tracker)
+
+
+# ---------------------------------------------------------------------------
+# M10: heartbeat edge-case coverage (Codex review)
+# ---------------------------------------------------------------------------
+
+
+def test_interim_save_failure_does_not_mark_saved(monkeypatch, tmp_path: Path):
+    """M10-1: If save_agent_context raises during _interim_save_locked,
+    _saved_seq must NOT advance — the heartbeat's next tick will retry.
+
+    Design note: _heartbeat_tick returns True meaning "attempted a save"
+    (it entered the save path), but _saved_seq only advances when the
+    underlying save_agent_context succeeds. So on failure, _saved_seq
+    stays behind _activity_seq and the next heartbeat tick will try again.
+    """
+    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="0")
+    try:
+        tracker.record("add_lesson", "important data")
+        saved_before = tracker._saved_seq
+
+        # Monkey-patch save_agent_context to blow up
+        def exploding_save(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(mcp_server._engram, "save_agent_context", exploding_save)
+
+        # Drive a heartbeat tick — it will attempt _interim_save_locked
+        # which calls save_agent_context → exception caught inside
+        # _interim_save_locked → _saved_seq stays unchanged.
+        tracker._heartbeat_tick()
+
+        assert tracker._saved_seq == saved_before, (
+            "_saved_seq must not advance when save_agent_context raises — "
+            "otherwise the heartbeat will never retry"
+        )
+
+        # Confirm retry: since _saved_seq < _activity_seq the next tick
+        # will attempt another save (it should still "fire").
+        fired = tracker._heartbeat_tick()
+        assert fired is True, (
+            "The heartbeat should retry saving on the next tick because "
+            "_saved_seq is still behind _activity_seq"
+        )
+    finally:
+        _shutdown(tracker)
+
+
+def test_record_count_trigger_runs_interim_save(monkeypatch, tmp_path: Path):
+    """M10-2: Calling record() _CHECKPOINT_EVERY times must trigger a
+    count-based checkpoint, incrementing _checkpoint_seq."""
+    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="0")
+    try:
+        assert tracker._checkpoint_seq == 0
+        # Drive exactly _CHECKPOINT_EVERY non-cold-start calls
+        for i in range(tracker._CHECKPOINT_EVERY):
+            tracker.record(f"add_lesson", f"lesson {i}")
+        assert tracker._checkpoint_seq >= 1, (
+            f"Expected at least 1 checkpoint after {tracker._CHECKPOINT_EVERY} "
+            f"record() calls, got {tracker._checkpoint_seq}"
+        )
+    finally:
+        _shutdown(tracker)
+
+
+def test_heartbeat_thread_exits_after_stop(monkeypatch, tmp_path: Path):
+    """M10-3: After _stop_event is set and thread is joined, the thread
+    must no longer be alive."""
+    tracker = _fresh_tracker(monkeypatch, tmp_path, interval="1")
+    try:
+        assert tracker._heartbeat_thread is not None
+        assert tracker._heartbeat_thread.is_alive()
+        # Signal stop and join
+        tracker._stop_event.set()
+        tracker._heartbeat_thread.join(timeout=5.0)
+        assert not tracker._heartbeat_thread.is_alive(), (
+            "Heartbeat thread must exit promptly after _stop_event is set"
+        )
     finally:
         _shutdown(tracker)

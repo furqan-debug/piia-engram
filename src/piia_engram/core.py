@@ -154,8 +154,11 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
                 return None
             # The "in-progress current session" must not be reported as
             # unclean — that's the breadcrumb _mark_session_start just
-            # wrote 1ms ago, not a kill survivor.
-            if pid == os.getpid():
+            # wrote 1ms ago, not a kill survivor. ``_owns_session_state``
+            # uses nonce + started_at so a fresh process that happens to
+            # inherit a recycled pid won't accidentally suppress the
+            # warning either (M1).
+            if self._owns_session_state(data):
                 return None
             return {
                 "pid": pid,
@@ -167,31 +170,87 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
             return None
 
     def _mark_session_start(self) -> None:
-        """Stamp session_state.json with the new session's metadata."""
+        """Stamp session_state.json with the new session's metadata.
+
+        v3.30 H5 fix: also record a per-process ``session_nonce`` so we
+        can later prove ownership of the on-disk breadcrumb when marking
+        a clean exit. Without that nonce two Engram processes that share
+        the same ``ENGRAM_DIR`` would step on each other's session
+        markers — A's clean exit could erase B's unclean-exit signal.
+        """
         # We deliberately don't preserve the previous file: get_unclean_exit_marker
         # is meant to be called once per init (before we overwrite the file).
         # Callers that need to surface the warning must do so on init.
         self._prev_unclean = self.get_unclean_exit_marker()
+        # Per-process owner identifiers. ``session_nonce`` is the
+        # canonical owner key — pid + started_at alone are not unique
+        # enough across pid reuse (M1) or NTP clock skew.
+        import secrets
+        self._session_pid = os.getpid()
+        self._session_started_at = _now_iso()
+        self._session_nonce = secrets.token_hex(8)
         payload = {
-            "pid": os.getpid(),
-            "started_at": _now_iso(),
-            "last_seen_at": _now_iso(),
+            "pid": self._session_pid,
+            "started_at": self._session_started_at,
+            "last_seen_at": self._session_started_at,
             "last_clean_exit": False,
             "last_session_id": "",
+            "session_nonce": self._session_nonce,
         }
         try:
             _write_json(self._session_state_path, payload)
         except Exception:
             pass
 
+    def _owns_session_state(self, data: dict | None) -> bool:
+        """Return True iff ``data`` on disk was written by this process.
+
+        Owner is verified by ``session_nonce`` (preferred) with a
+        ``pid + started_at`` fallback for older v3.30 files that don't
+        yet have a nonce. Anything else means another process owns the
+        breadcrumb and we must not touch ``last_clean_exit``.
+        """
+        if not isinstance(data, dict):
+            return False
+        my_nonce = getattr(self, "_session_nonce", None)
+        on_disk_nonce = data.get("session_nonce")
+        if on_disk_nonce:
+            # Disk has a v3.30+ nonce.  We can only claim ownership if
+            # we also have a nonce AND the two match.  During init
+            # (before _mark_session_start sets our nonce) my_nonce is
+            # None — that means the on-disk marker belongs to a
+            # *previous* session, not ours. Returning False here lets
+            # get_unclean_exit_marker correctly surface a crash even
+            # when the OS has recycled the old process's pid (H1 fix).
+            return bool(my_nonce) and on_disk_nonce == my_nonce
+        # Pre-nonce fallback: disk has no nonce (pre-v3.30 marker).
+        # We must have our own identifiers already set to make a
+        # meaningful comparison; during init they're absent, so we
+        # can't prove ownership and must return False (safe default).
+        my_pid = getattr(self, "_session_pid", None)
+        if my_pid is None:
+            return False
+        if data.get("pid") != my_pid:
+            return False
+        my_started = getattr(self, "_session_started_at", None)
+        if my_started and data.get("started_at") != my_started:
+            return False
+        return True
+
     def _mark_clean_exit(self, last_session_id: str = "") -> None:
         """Stamp session_state.json with last_clean_exit=True on graceful shutdown.
 
-        Called from the mcp_server atexit handler. Safe to call multiple
-        times — last write wins.
+        v3.30 H5 fix: only writes when the breadcrumb on disk is the one
+        this process wrote at ``_mark_session_start``. If another
+        Engram process has since taken over the file, we leave its
+        ``last_clean_exit=False`` flag alone so its eventual crash is
+        still detectable.
         """
         try:
             data = _read_json(self._session_state_path)
+            if not self._owns_session_state(data if isinstance(data, dict) else None):
+                # Another process owns the marker. Don't clobber it.
+                return
             if not isinstance(data, dict):
                 data = {}
             data.update({

@@ -129,17 +129,18 @@ class _SessionTracker:
         # atexit fires (SIGKILL, OOM, host crash). Set the env var to 0 to
         # disable. _lock serializes record / _interim_save across threads.
         self._lock = threading.Lock()
-        # _last_save_at sentinel: datetime.min means "never saved". Using a
-        # value strictly less than any future timestamp avoids a Windows
-        # gotcha: datetime.now() precision is ~15ms, so initializing
-        # _last_save_at = start_time and then calling record() inside the
-        # same scheduler tick yields _last_save_at == _last_activity_at,
-        # which the heartbeat would mis-read as "no new activity" and
-        # never fire the first checkpoint. datetime.min sidesteps that.
+        # _last_save_at sentinel: datetime.min means "never saved".
         self._last_save_at = _dt.min
-        # Timestamp of the most recent record() call. Heartbeat compares this
-        # against _last_save_at to decide if a checkpoint is needed.
+        # Timestamp of the most recent record() call (kept for diagnostics).
         self._last_activity_at = self.start_time
+        # Monotonic activity / save sequences. The heartbeat uses these
+        # — not timestamps — to detect "new activity since last save".
+        # Timestamps hit Windows' ~15ms clock precision when record() and
+        # _interim_save_locked() run back-to-back inside the same tick,
+        # which made the H6 deterministic tests flaky. A monotonic int
+        # never collides.
+        self._activity_seq = 0
+        self._saved_seq = 0
         self._heartbeat_interval = self._read_heartbeat_interval()
         self._stop_event = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
@@ -178,6 +179,7 @@ class _SessionTracker:
                 "args_summary": args_summary,
             })
             self._last_activity_at = now
+            self._activity_seq += 1
             trigger_checkpoint = False
             if tool_called not in self._COLD_START_TOOLS:
                 self._real_call_count += 1
@@ -189,38 +191,41 @@ class _SessionTracker:
                 # _last_save_at consistent with the snapshot contents.
                 self._interim_save_locked(reason="count")
 
+    def _heartbeat_tick(self) -> bool:
+        """Run one heartbeat iteration synchronously.
+
+        Returns ``True`` iff a checkpoint was written this tick.
+        Extracted from ``_heartbeat_loop`` so tests can drive a single
+        deterministic tick without ``time.sleep`` waits (H6). The
+        decision uses the ``_activity_seq`` / ``_saved_seq`` counters
+        rather than timestamps so back-to-back ticks on Windows' ~15ms
+        clock can't false-positive "nothing new".
+        """
+        try:
+            with self._lock:
+                if not self.calls:
+                    return False
+                if self._saved_seq >= self._activity_seq:
+                    return False
+                self._interim_save_locked(reason="heartbeat")
+                return True
+        except Exception as exc:
+            logger.debug("heartbeat checkpoint failed: %s", exc)
+            return False
+
     def _heartbeat_loop(self) -> None:
         """Daemon thread: periodically checkpoint when there is unsaved activity.
 
-        Wakes every _heartbeat_interval seconds. If new tool calls arrived
-        since the last save, takes the lock and writes a checkpoint. Stops
-        cleanly when _stop_event is set (auto_save) or when the process is
-        killed (daemon thread dies with the main thread).
+        Wakes every ``_heartbeat_interval`` seconds and calls
+        ``_heartbeat_tick``. Stops cleanly when ``_stop_event`` is set
+        (auto_save) or when the process is killed (daemon thread dies
+        with the main thread).
         """
         interval = self._heartbeat_interval
         if interval <= 0:
             return
         while not self._stop_event.wait(interval):
-            try:
-                with self._lock:
-                    if not self.calls:
-                        continue
-                    # >= is correct here because _last_save_at starts at
-                    # datetime.min (see __init__), so the initial state
-                    # _last_save_at (min) >= _last_activity_at (start_time)
-                    # is False → first heartbeat fires correctly. After a
-                    # save, _last_save_at is strictly greater than the
-                    # _last_activity_at it captured, so subsequent idle
-                    # ticks skip cleanly.
-                    if self._last_save_at >= self._last_activity_at:
-                        # No new record() since last save — skip the tick so
-                        # idle sessions don't accumulate redundant checkpoint
-                        # files every interval.
-                        continue
-                    self._interim_save_locked(reason="heartbeat")
-            except Exception as exc:
-                # Best-effort: heartbeat must never crash the host process.
-                logger.debug("heartbeat checkpoint failed: %s", exc)
+            self._heartbeat_tick()
 
     def detect_tool(self, tool: str) -> None:
         if not self.tool_name and tool:
@@ -281,17 +286,28 @@ class _SessionTracker:
                 actions=actions,
             )
             # Only mark "saved" if the call succeeded — otherwise the
-            # heartbeat will retry on its next tick.
+            # heartbeat will retry on its next tick. ``_saved_seq``
+            # snapshots ``_activity_seq`` at the start of this save so a
+            # record() that lands after the I/O but before this line
+            # still triggers another heartbeat tick.
             self._last_save_at = _dt.now()
+            self._saved_seq = self._activity_seq
         except Exception:
             pass  # silent — checkpoints are best-effort
 
     def auto_save(self) -> None:
         """Save accumulated session log. Called by atexit handler."""
         # Stop the heartbeat thread first so it doesn't race the final save.
-        # daemon threads will be torn down with the process anyway, but
-        # signaling stop here lets the loop exit cleanly within one tick.
+        # M5: join the thread to guarantee it isn't mid-write when we
+        # proceed with the final checkpoint below.
         self._stop_event.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=3.0)
+            if self._heartbeat_thread.is_alive():
+                logger.warning(
+                    "heartbeat thread still alive after 3 s join; "
+                    "final save may overlap — proceeding anyway"
+                )
         if self.saved:
             return
         # Check minimum work threshold

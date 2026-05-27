@@ -198,7 +198,7 @@ def test_readme_documents_tool_tiering():
 
 
 def test_mcp_tool_count_and_merge_tool():
-    """MCP server 应暴露 48 个工具且包含统一知识生命周期工具。"""
+    """MCP server 应暴露完整工具集合，包含 v3.30 新增工具。"""
     tree = ast.parse(MCP_SERVER.read_text(encoding="utf-8"))
     tools = []
     for node in ast.walk(tree):
@@ -212,7 +212,13 @@ def test_mcp_tool_count_and_merge_tool():
             ):
                 tools.append(node.name)
                 break
-    assert len(tools) >= 57
+    # v3.30 M13: bumped from >=57 to >=65 so any silently-removed tool
+    # is caught. The current count is 65 — adding new tools is fine
+    # (the assertion is a floor); removing one must be deliberate.
+    assert len(tools) >= 65, (
+        f"Expected >=65 @mcp.tool() definitions, found {len(tools)}. "
+        "If a tool was removed intentionally, update this floor."
+    )
     assert "update_knowledge" in tools
     assert "update_playbook" in tools
     assert "archive_playbook" in tools
@@ -226,6 +232,10 @@ def test_mcp_tool_count_and_merge_tool():
     assert "get_stale_knowledge" in tools
     assert "update_execution_step" in tools
     assert "get_execution_status" in tools
+    # v3.30 newcomers — pin them explicitly so an accidental removal
+    # surfaces here before users notice in a release.
+    assert "get_resume_brief" in tools
+    assert "get_daily_log" in tools
     assert "get_safe_profile" not in tools
     assert "update_lesson" not in tools
     assert "update_decision" not in tools

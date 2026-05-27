@@ -34,10 +34,20 @@ def isolated_engram(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Engram:
 
     Also resets ``_session`` to prevent test tool calls from leaking into the
     real ``~/.engram/`` directory via the atexit handler.
+
+    M6 fix: stop the OLD tracker's heartbeat thread before replacing it,
+    and disable heartbeat on the new one to keep tests deterministic.
     """
+    # Stop old heartbeat thread to prevent cross-test leaks (M6).
+    old_session = mcp_server._session
+    old_session._stop_event.set()
+    if old_session._heartbeat_thread is not None:
+        old_session._heartbeat_thread.join(timeout=2.0)
+
     engram = Engram(root=tmp_path)
     monkeypatch.setattr(mcp_server, "_engram", engram)
-    # Reset session tracker so test calls don't pollute real data on atexit
+    # Disable heartbeat for test tracker to avoid daemon thread noise.
+    monkeypatch.setenv("ENGRAM_HEARTBEAT_INTERVAL", "0")
     monkeypatch.setattr(mcp_server, "_session", mcp_server._SessionTracker())
     return engram
 
@@ -1123,3 +1133,67 @@ def test_get_user_context_no_user_prompt_omits_section(isolated_engram: Engram):
     isolated_engram.update_profile({"role": "developer"})
     result = _run(mcp_server.get_user_context())
     assert "当前用户提问" not in result
+
+
+# ---------------------------------------------------------------------------
+# M11: MCP wrapper + doctor WARN coverage (Codex review)
+# ---------------------------------------------------------------------------
+
+
+class TestResumeBriefWrapper:
+    def test_mcp_get_resume_brief_wrapper(self, isolated_engram: Engram, tmp_path: Path):
+        """M11-1: get_resume_brief must return an <engram-resume …> XML block."""
+        result = _run(mcp_server.get_resume_brief(project_folder=str(tmp_path)))
+        assert "<engram-resume" in result, (
+            f"Expected '<engram-resume' tag in resume brief output, got: {result[:200]}"
+        )
+
+
+class TestDoctorUncleanExitWarn:
+    def test_doctor_surfaces_unclean_exit_warn(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """M11-2: When session_state.json shows an unclean prior exit,
+        doctor's JSON output must contain a check with name='unclean_exit'
+        and status='WARN'."""
+        import os
+
+        # 1. Write a session_state.json that simulates a prior unclean exit
+        #    with a pid that is NOT this process (so _prev_unclean is populated).
+        state_path = tmp_path / "session_state.json"
+        fake_pid = 1 if os.getpid() != 1 else 2
+        state_data = json.dumps({
+            "pid": fake_pid,
+            "last_clean_exit": False,
+            "started_at": "2026-01-01T00:00:00",
+            "last_seen_at": "2026-01-01T00:05:00",
+            "last_session_id": "fake-prior-session",
+            "session_nonce": "deadbeef12345678",
+        })
+        state_path.write_text(state_data, encoding="utf-8")
+
+        # 2. Construct an Engram instance that reads the unclean breadcrumb.
+        engram = Engram(root=tmp_path)
+        assert engram._prev_unclean is not None, (
+            "Engram should detect the unclean prior exit from session_state.json"
+        )
+
+        # 3. Patch the module-level _engram and stop old heartbeat.
+        old_session = mcp_server._session
+        old_session._stop_event.set()
+        if old_session._heartbeat_thread is not None:
+            old_session._heartbeat_thread.join(timeout=2.0)
+
+        monkeypatch.setattr(mcp_server, "_engram", engram)
+        monkeypatch.setenv("ENGRAM_HEARTBEAT_INTERVAL", "0")
+        monkeypatch.setattr(mcp_server, "_session", mcp_server._SessionTracker())
+
+        # 4. Run doctor in JSON mode and verify
+        result = _run(mcp_server.doctor(output_format="json"))
+        parsed = json.loads(result)
+        checks = parsed.get("checks", [])
+        unclean_checks = [c for c in checks if c.get("name") == "unclean_exit"]
+        assert len(unclean_checks) == 1, (
+            f"Expected exactly one 'unclean_exit' check, found: {unclean_checks}"
+        )
+        assert unclean_checks[0]["status"] == "WARN", (
+            f"Expected status='WARN', got: {unclean_checks[0]['status']}"
+        )

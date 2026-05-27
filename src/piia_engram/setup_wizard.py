@@ -518,33 +518,76 @@ def _remove_instruction_snippet(tool_id: str) -> bool:
         return False
 
 
-def _find_engram_hook_script(name: str) -> Path | None:
-    """Locate a script under engram/scripts/ across dev tree and pip-installed package."""
-    candidate = Path(__file__).resolve().parent.parent.parent / "scripts" / name
-    if candidate.is_file():
-        return candidate
-    try:
-        import importlib.util
-        spec = importlib.util.find_spec("piia_engram")
-        if spec and spec.origin:
-            pkg_root = Path(spec.origin).parent.parent.parent
-            alt = pkg_root / "scripts" / name
-            if alt.is_file():
-                return alt
-    except Exception:
-        pass
-    return None
+_HOOK_MODULES = {
+    "auto_save_on_stop": "piia_engram.hooks.auto_save_on_stop",
+    "auto_inject_resume_brief": "piia_engram.hooks.auto_inject_resume_brief",
+}
+
+
+def _quote_for_shell(value: str) -> str:
+    """Cross-platform shell quoting for an absolute file path.
+
+    Wraps the value in double quotes and escapes any embedded double
+    quote / backslash sequences.  Works in POSIX shells and Windows
+    ``cmd.exe`` (which is the shell Claude Code's hook runner uses —
+    Node.js ``child_process.exec()`` defaults to ``cmd.exe`` on
+    Windows, not PowerShell).
+
+    .. note::
+
+       If Claude Code ever changes to spawn hooks via PowerShell, the
+       command would need a ``& `` call-operator prefix for quoted
+       executables.  That change would be handled in
+       ``_build_engram_hook_command``, not here.
+
+    We deliberately don't pre-mangle backslashes the way the old code
+    did — ``json.dumps`` later escapes the resulting string for JSON,
+    and shells receive the original separators unchanged. That fixes the
+    "double-escape on Windows / mixed quoting on macOS" bug from H2.
+    """
+    if not value:
+        return '""'
+    # Backslash-escape any embedded backslash followed by a quote, then
+    # the quotes themselves. This is the canonical Windows quoting rule
+    # and is also accepted by POSIX shells.
+    out = value.replace('"', '\\"')
+    return f'"{out}"'
+
+
+def _build_engram_hook_command(
+    python_path: str,
+    *,
+    module: str,
+    extra_env: dict[str, str] | None = None,
+) -> str:
+    """Build the ``command`` string for a hook entry.
+
+    Uses ``"{python}" -m piia_engram.hooks.<module>`` so we don't have
+    to ship the script outside the wheel and don't have to quote a
+    script path. Env hints are passed as ``--env KEY=VAL`` pairs that
+    the hook module parses from ``sys.argv`` — that's the only env
+    transport that works identically on Windows cmd, PowerShell, and
+    POSIX shells without an inline ``KEY=VAL prog`` prefix (which
+    Windows shells don't understand).
+    """
+    parts: list[str] = [_quote_for_shell(python_path), "-m", module]
+    if extra_env:
+        for key, value in extra_env.items():
+            parts.append("--env")
+            parts.append(_quote_for_shell(f"{key}={value}"))
+    return " ".join(parts)
 
 
 def _inject_claude_code_hook_for_event(
     python_path: str,
     *,
     event: str,
-    script_name: str,
+    module: str,
     status_message: str,
     timeout: int = 30,
     extra_env: dict[str, str] | None = None,
     marker_keywords: tuple[str, ...] = ("piia_engram",),
+    async_hook: bool = True,
 ) -> str | None:
     """Register a per-event hook in ``~/.claude/settings.json``.
 
@@ -555,34 +598,23 @@ def _inject_claude_code_hook_for_event(
     Args:
         python_path: Absolute path to the python interpreter to invoke.
         event: Claude Code hook event name (``Stop``, ``PreCompact``, etc.).
-        script_name: File name under ``engram/scripts/`` to execute.
+        module: Dotted python module to run via ``python -m``.
         status_message: ``statusMessage`` field shown in Claude Code UI.
         timeout: Hook timeout in seconds.
-        extra_env: Extra env vars to set when spawning the hook
-            (prepended to the command as ``KEY=VAL`` shell prefix).
+        extra_env: Extra env hints; transported as ``--env KEY=VAL`` argv.
         marker_keywords: Strings used to detect "already registered".
+        async_hook: ``True`` for fire-and-forget Stop / PreCompact;
+            ``False`` for SessionStart, where ``additionalContext`` must
+            be written before the first user turn is processed.
 
     Returns the settings path on success, None on failure / already-present.
     """
     try:
         settings_path = Path.home() / ".claude" / "settings.json"
 
-        hook_script = _find_engram_hook_script(script_name)
-        if hook_script is None:
-            return None
-
-        hook_script_str = str(hook_script).replace("\\", "\\\\")
-        python_path_str = python_path.replace("\\", "\\\\")
-        # extra_env prefix — works in bash on macOS/Linux and is parsed by
-        # Claude Code's shell invocation on Windows under Git Bash. For
-        # cross-platform safety we encode the env hint inside the script
-        # via argv too (see below).
-        env_prefix = ""
-        if extra_env:
-            env_prefix = " ".join(
-                f'{k}={v}' for k, v in extra_env.items()
-            ) + " "
-        engram_command = f'{env_prefix}{python_path_str} "{hook_script_str}"'
+        engram_command = _build_engram_hook_command(
+            python_path, module=module, extra_env=extra_env,
+        )
 
         settings: dict = {}
         if settings_path.is_file():
@@ -596,15 +628,21 @@ def _inject_claude_code_hook_for_event(
             for hook in event_group.get("hooks", []):
                 cmd = hook.get("command", "")
                 if any(kw in cmd for kw in marker_keywords):
+                    logger.info(
+                        "Engram %s hook already registered (marker %s found)",
+                        event,
+                        next(kw for kw in marker_keywords if kw in cmd),
+                    )
                     return None  # Already registered
 
-        engram_hook = {
+        engram_hook: dict = {
             "type": "command",
             "command": engram_command,
             "timeout": timeout,
-            "async": True,
             "statusMessage": status_message,
         }
+        if async_hook:
+            engram_hook["async"] = True
 
         if event_groups:
             event_groups[0].setdefault("hooks", []).append(engram_hook)
@@ -618,7 +656,10 @@ def _inject_claude_code_hook_for_event(
         )
         return str(settings_path)
 
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Failed to register Engram %s hook: %s", event, exc,
+        )
         return None
 
 
@@ -633,10 +674,11 @@ def _inject_claude_code_hook(python_path: str) -> str | None:
     return _inject_claude_code_hook_for_event(
         python_path,
         event="Stop",
-        script_name="auto_save_on_stop.py",
+        module=_HOOK_MODULES["auto_save_on_stop"],
         status_message="Engram 会话自动保存...",
         timeout=30,
-        marker_keywords=("auto_save_on_stop", "piia_engram"),
+        marker_keywords=("auto_save_on_stop", "piia_engram.hooks.auto_save_on_stop"),
+        async_hook=True,
     )
 
 
@@ -656,7 +698,7 @@ def _inject_claude_code_precompact_hook(python_path: str) -> str | None:
     return _inject_claude_code_hook_for_event(
         python_path,
         event="PreCompact",
-        script_name="auto_save_on_stop.py",
+        module=_HOOK_MODULES["auto_save_on_stop"],
         status_message="Engram pre-compact 兜底保存...",
         timeout=30,
         extra_env={
@@ -664,6 +706,7 @@ def _inject_claude_code_precompact_hook(python_path: str) -> str | None:
             "CLAUDE_INVOKED_BY": "engram_precompact",
         },
         marker_keywords=("CLAUDE_INVOKED_BY=engram_precompact",),
+        async_hook=True,
     )
 
 
@@ -681,7 +724,7 @@ def _inject_claude_code_sessionstart_hook(python_path: str) -> str | None:
     return _inject_claude_code_hook_for_event(
         python_path,
         event="SessionStart",
-        script_name="auto_inject_resume_brief.py",
+        module=_HOOK_MODULES["auto_inject_resume_brief"],
         status_message="Engram 接续简报注入...",
         timeout=15,
         extra_env={"CLAUDE_INVOKED_BY": "engram_session_start"},
@@ -689,6 +732,12 @@ def _inject_claude_code_sessionstart_hook(python_path: str) -> str | None:
             "auto_inject_resume_brief",
             "CLAUDE_INVOKED_BY=engram_session_start",
         ),
+        # SessionStart must be synchronous: Claude Code only splices
+        # ``hookSpecificOutput.additionalContext`` into the first user
+        # turn if the hook returned before that turn was assembled.
+        # Marking the hook async lets the first turn start before the
+        # brief is written, defeating the whole point of mechanism (6).
+        async_hook=False,
     )
 
 
@@ -2249,40 +2298,80 @@ def _run_functional_checks(*, fix: bool = False) -> int:
         print("    [info] No AI instruction snippets found.")
         print("           Run 'engram setup' to inject them.")
 
-    # ── Claude Code Stop Hook ──
+    # ── Claude Code Hooks (Stop / PreCompact / SessionStart) ──
+    # v3.30 M7: doctor must check all three events the setup wizard
+    # registers, not only Stop. Otherwise users who upgrade from
+    # v3.29.x and run ``engram doctor --fix`` end up missing PreCompact
+    # (mechanism 4) and SessionStart (mechanism 6) silently.
     print()
-    _safe_print("  -- Claude Code Stop Hook --\n")
+    _safe_print("  -- Claude Code Hooks --\n")
     settings_path = Path.home() / ".claude" / "settings.json"
-    hook_found = False
+    settings: dict = {}
     if settings_path.is_file():
         try:
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
-            for event_group in settings.get("hooks", {}).get("Stop", []):
-                for hook in event_group.get("hooks", []):
-                    cmd = hook.get("command", "")
-                    if "auto_save_on_stop" in cmd or "piia_engram" in cmd:
-                        hook_found = True
-                        _safe_print(f"    [ok] Stop hook registered in {settings_path}")
-                        break
-                if hook_found:
-                    break
         except Exception:
-            pass
+            settings = {}
 
-    if not hook_found:
-        _safe_print("    [--] No Engram Stop hook in Claude Code settings")
+    hook_specs = (
+        # (event, human label, markers, injector, doctor flag)
+        (
+            "Stop",
+            "Stop",
+            ("auto_save_on_stop", "piia_engram.hooks.auto_save_on_stop"),
+            _inject_claude_code_hook,
+        ),
+        (
+            "PreCompact",
+            "PreCompact",
+            ("CLAUDE_INVOKED_BY=engram_precompact",
+             "piia_engram.hooks.auto_save_on_stop"),
+            _inject_claude_code_precompact_hook,
+        ),
+        (
+            "SessionStart",
+            "SessionStart (resume brief inject)",
+            ("auto_inject_resume_brief",
+             "piia_engram.hooks.auto_inject_resume_brief"),
+            _inject_claude_code_sessionstart_hook,
+        ),
+    )
+
+    python_path_for_fix: str | None = None
+    for event, label, markers, injector in hook_specs:
+        found = False
+        for event_group in settings.get("hooks", {}).get(event, []):
+            for hook in event_group.get("hooks", []):
+                cmd = hook.get("command", "")
+                if any(m in cmd for m in markers):
+                    found = True
+                    break
+            if found:
+                break
+
+        if found:
+            _safe_print(f"    [ok] {label} hook registered")
+            continue
+
+        _safe_print(f"    [--] No Engram {label} hook in Claude Code settings")
         if fix:
-            python_path = _find_python()
-            if python_path:
-                result = _inject_claude_code_hook(python_path)
+            if python_path_for_fix is None:
+                python_path_for_fix = _find_python() or ""
+            if python_path_for_fix:
+                result = injector(python_path_for_fix)
                 if result:
-                    _safe_print(f"    [fixed] Stop hook registered: {result}")
+                    _safe_print(f"    [fixed] {label} hook registered: {result}")
                 else:
-                    _safe_print("    [info] Could not register hook (script not found)")
+                    _safe_print(
+                        f"    [info] Could not register {label} hook"
+                    )
             else:
                 _safe_print("    [info] Cannot fix: Python not found")
         else:
-            print("           Run 'engram doctor --fix' or 'engram setup' to register.")
+            print(
+                f"           Run 'engram doctor --fix' or 'engram setup' "
+                f"to register the {label} hook."
+            )
 
     print()
     return problems
