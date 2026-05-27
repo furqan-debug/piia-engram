@@ -345,8 +345,7 @@ ENGRAM_AUTH_TOKEN=abc123... python -m piia_engram.mcp_server --transport sse --h
 | PBKDF2 轮数 | **600,000**（符合 OWASP 2023+ 推荐；100k 旧密文仍可解密）|
 | 加密 | AES-256-GCM，每条数据随机 salt + nonce |
 | 冷启动延迟 | < 100 ms（本地 JSON，无网络）|
-| 核心功能网络调用 | 默认 **0** —— 除可选的 `read_web_content` 外，匿名使用统计可选开启（[隐私详情](PRIVACY.md)、[遥测路线图](docs/telemetry_roadmap.md)）|
-| 外部 AI 评测 | 4 个独立 AI 评审了使用统计设计；此前 3 次架构评测（见 [`docs/`](docs/)）|
+| 核心功能网络调用 | 默认 **0** —— 除可选的 `read_web_content` 外，匿名使用统计可选开启（详见 [隐私说明](PRIVACY.md)）|
 
 ## 核心功能
 

@@ -2,13 +2,11 @@
 
 发布 piia-engram 新版本的完整流程。每次 `git push` + `gh release create` 之前过一遍这份清单。
 
-> **历史教训**：v3.13/v3.29 系列曾因仓库历史里残留竞品名、内部战略思路、本地路径、临时 token 等内容，事后不得不做 `git filter-repo` 历史重写。这份 playbook 的存在就是为了**让脱敏成为发布的常规一步**，而不是事后补救。
-
 ---
 
 ## 0. 触发时机
 
-- **GitHub Release**：每 ~3 天发一次（用户偏好节奏）。
+- **GitHub Release**：按维护者节奏发布。
 - **PyPI publish**：跟随 GitHub Release（`publish.yml` workflow 自动触发）。
 - **代码 commit + push**：可随时推，但单纯 commit 不算"发布"，只是节奏更细的检查点。
 
@@ -73,19 +71,17 @@ Engram 是开源仓库 + 公开发布，仓库内容会进入：
 | **核心未公开思路** | 尚未在 README/CHANGELOG 公开的产品方向、长期路线图 | 留在私有笔记 / Engram 本地记忆里，不进仓库文档 |
 | **内部代号** | 私有项目 / 团队 / 内部里程碑代号 | 改成对外名称 |
 
-### 2.4 竞品 / 核心思路的安全表述
+### 2.4 比较 / 核心思路的安全表述
 
 > 红线：**比较可以做，绝对化表述、贬损、内部情报不可以**。
 
-| ❌ 不要这样写 | ✅ 改成这样 |
-|---|---|
-| "X 公司的方案有 bug" | "vector DB 方案在小语料场景下召回率偏低" |
-| "我们要替代 X" | "Engram 与 X 解决的问题不同：X 是 agent memory，Engram 是 user identity" |
-| "没有任何工具能做到 X" | "Among the projects we've surveyed, piia-engram is the only one using X"（R2 修复模式） |
-| "X 在融资 Y 美元" | 不写 |
-| 引用竞品未公开的源码 / 内部文档 | 不写 |
+通用原则：
+- 用**类别**而不是**具体公司名**做对比（"vector DB 方案"而不是某厂商）
+- 描述差异而不是优劣（"解决的问题不同"而不是"我们更好"）
+- 避免绝对化表述（用"我们调研过的项目中"而不是"没有任何工具能"）
+- 不写第三方的非公开商业信息、不引用第三方未公开内容
 
-具体的措辞示例参考 `docs/comparison.md`——这是经过五方审查 + R2 修复的"可证伪表述"基线。
+具体措辞参考 `docs/comparison.md`。
 
 ### 2.5 推荐扫描命令
 
@@ -151,12 +147,11 @@ gh release create vX.Y.Z \
 
 ## 5. 推送后文档同步（Post-Push Doc Sync）
 
-工作空间根目录 `CLAUDE.md` 已定义"推送后文档同步规则"——这里只重复关键项：
+发版后建议维护的下游同步：
 
-- `PROJECT_REGISTRY.md` 顶部 auto-status 数字（版本 / 测试数 / stars / 日期）
-- `LOCAL_TOOLS_REGISTRY.md` 中 `piia-engram` 版本
-- 重大事件加进 PROJECT_REGISTRY 第 10.2 / 11 / 11.5 节
-- 沉淀关键经验 / 决策到 Engram（`add_lesson` / `add_decision`）
+- 任何包含版本号 / 测试数 / star 数等"易变数字"的本地文档
+- 任何引用 piia-engram 版本的 manifest / lockfile
+- 沉淀关键经验 / 决策到 Engram（`add_lesson` / `add_decision`），下次发版可参考
 
 ---
 

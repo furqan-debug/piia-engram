@@ -69,16 +69,17 @@ experiments/beta_recruitment*.md
 docs/messaging.md
 docs/vision.md
 
-# Strategic / weakness-exposing docs (v3.30 second-pass sanitization)
-# These either: (a) expose self-assessed weak spots to competitors,
-# (b) reveal design rationale that's our competitive edge, or
-# (c) hand competitors a roadmap they can copy / counter.
+# Internal / strategic documents
 docs/design/
 docs/telemetry_roadmap.md
 docs/playbook-auto-extraction-design.md
 docs/milestone_review_*.md
 docs/milestone_review_*.html
-experiments/evaluations/v3.16.0/cross_ai/
-# Backup directory for sanitization (kept outside the repo by path,
-# but defensive in case anyone clones it sideways into the tree)
+docs/coverage_baseline_*.md
+experiments/evaluations/v*/cross_ai/
+experiments/evaluations/v*/REPORT.md
+experiments/evaluations/v*/README.md
+experiments/evaluations/v*/evidence_pack.md
+experiments/evaluations/v*/run_evaluation.py
+experiments/dynamic_loading/HOW_TO_TEST.md
 **/engram-private-strategy/

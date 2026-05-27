@@ -160,4 +160,3 @@ You could absolutely run **Engram + Letta + Mem0** together: Engram for who you 
 
 - [README](../README.md) — what Engram is and how to install
 - [architecture.md](architecture.md) — internal structure of Engram itself
-- [milestone_review_v3.13.2.md](milestone_review_v3.13.2.md) — external AI audit that drove the v3.14.x positioning work

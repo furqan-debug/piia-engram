@@ -254,5 +254,4 @@ Set `ENGRAM_TOOLS=all` to expose the full 43 tools (review, health, link/unlink,
 - README user-facing intro: [README.md](../README.md) · [中文版](../README.zh-CN.md)
 - Security model: [SECURITY.md](../SECURITY.md)
 - Contributing & test baseline: [CONTRIBUTING.md](../CONTRIBUTING.md)
-- Coverage baseline: [coverage_baseline_v3.14.2.md](coverage_baseline_v3.14.2.md) (historical) — current: 678 tests, 96% total
-- Recent milestone review (v3.13.2 external audit): [milestone_review_v3.13.2.md](milestone_review_v3.13.2.md)
+- Release process: [release-playbook.md](release-playbook.md)

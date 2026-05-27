@@ -547,8 +547,7 @@ These are factual claims about piia-engram itself, refreshed each minor release.
 | PBKDF2 iterations | **600,000** (OWASP 2023+ floor; legacy 100k still decrypts) |
 | Encryption | AES-256-GCM, per-value random salt + nonce |
 | Cold-start time | < 100 ms typical (local JSON, no network) |
-| Network calls from core | **0** by default — except optional `read_web_content` and opt-in anonymous usage statistics (local + optional remote — [privacy details](PRIVACY.md), [telemetry roadmap](docs/telemetry_roadmap.md)) |
-| External AI evaluations | 4 independent AIs evaluated the telemetry design; 3 earlier evaluations on architecture (see [`docs/`](docs/)) |
+| Network calls from core | **0** by default — except optional `read_web_content` and opt-in anonymous usage statistics (local + optional remote — see [privacy details](PRIVACY.md)) |
 
 ## Built With
 
