@@ -21,16 +21,9 @@ piia-engram is a **local-first** tool. Your identity, preferences, lessons, and 
 │                                        telemetry.log       │
 │                                        (local, opt-in)     │
 └─────────────────────────────────────────────────────────────┘
-                                                  │
-                              Phase 2 only        │ opt-in
-                              (not yet active)    │ anonymous
-                                                  ▼
-                                    ┌──────────────────────┐
-                                    │  Cloudflare Worker   │
-                                    │  (aggregated counts  │
-                                    │   only, no content)  │
-                                    └──────────────────────┘
 ```
+
+Current implementation: local log only — no network requests are made for telemetry. If a future version offers remote aggregation, it will require separate re-consent.
 
 ## What piia-engram stores locally
 
@@ -87,19 +80,9 @@ piia-engram offers **opt-in** anonymous usage statistics to help the project und
 - All payloads are human-readable in `~/.engram/telemetry.log`
 - `engram telemetry preview` shows the exact next payload before sending
 
-### Phased rollout
+### Current status
 
-| Phase | Status | Network? | Details |
-|-------|--------|----------|---------|
-| **Phase 1** (v3.15.0+) | Active | No — local log only | Data written to `~/.engram/telemetry.log`, stays on your machine |
-| **Phase 2** | Not yet active | Yes — opt-in remote | Requires separate re-consent; will not activate until prerequisites are met (see [telemetry_roadmap.md](docs/telemetry_roadmap.md)) |
-
-Phase 2 prerequisites (all must be met before it can be built):
-1. Phase 1 live for 30+ days
-2. At least 5 users voluntarily share their telemetry.log
-3. No negative community feedback about Phase 1
-
-If prerequisites are not met, Phase 2 is cancelled. See [telemetry_roadmap.md](docs/telemetry_roadmap.md) for full details.
+Telemetry is local-log-only: data is written to `~/.engram/telemetry.log` and never leaves your machine. Any future change that would transmit data remotely will require separate explicit re-consent.
 
 ### Optional feedback reports
 
