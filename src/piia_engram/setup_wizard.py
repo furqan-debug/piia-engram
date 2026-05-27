@@ -518,62 +518,98 @@ def _remove_instruction_snippet(tool_id: str) -> bool:
         return False
 
 
-def _inject_claude_code_hook(python_path: str) -> str | None:
-    """Register Engram Stop hook in Claude Code settings.json.
+def _find_engram_hook_script(name: str) -> Path | None:
+    """Locate a script under engram/scripts/ across dev tree and pip-installed package."""
+    candidate = Path(__file__).resolve().parent.parent.parent / "scripts" / name
+    if candidate.is_file():
+        return candidate
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("piia_engram")
+        if spec and spec.origin:
+            pkg_root = Path(spec.origin).parent.parent.parent
+            alt = pkg_root / "scripts" / name
+            if alt.is_file():
+                return alt
+    except Exception:
+        pass
+    return None
 
-    Adds the auto_save_on_stop.py hook to Claude Code's Stop event.
-    Idempotent: skips if engram hook already registered.
 
-    Returns the settings path if injected, None otherwise.
+def _inject_claude_code_hook_for_event(
+    python_path: str,
+    *,
+    event: str,
+    script_name: str,
+    status_message: str,
+    timeout: int = 30,
+    extra_env: dict[str, str] | None = None,
+    marker_keywords: tuple[str, ...] = ("piia_engram",),
+) -> str | None:
+    """Register a per-event hook in ``~/.claude/settings.json``.
+
+    Generic core used by Stop / PreCompact / SessionStart wiring (v3.30).
+    Idempotent — skips if any hook matching ``marker_keywords`` already
+    appears in the event group.
+
+    Args:
+        python_path: Absolute path to the python interpreter to invoke.
+        event: Claude Code hook event name (``Stop``, ``PreCompact``, etc.).
+        script_name: File name under ``engram/scripts/`` to execute.
+        status_message: ``statusMessage`` field shown in Claude Code UI.
+        timeout: Hook timeout in seconds.
+        extra_env: Extra env vars to set when spawning the hook
+            (prepended to the command as ``KEY=VAL`` shell prefix).
+        marker_keywords: Strings used to detect "already registered".
+
+    Returns the settings path on success, None on failure / already-present.
     """
     try:
         settings_path = Path.home() / ".claude" / "settings.json"
 
-        # Find the hook script
-        hook_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "auto_save_on_stop.py"
-        if not hook_script.is_file():
-            # Fallback: try installed package location
-            import importlib.util
-            spec = importlib.util.find_spec("piia_engram")
-            if spec and spec.origin:
-                pkg_root = Path(spec.origin).parent.parent.parent
-                hook_script = pkg_root / "scripts" / "auto_save_on_stop.py"
-            if not hook_script.is_file():
-                return None
+        hook_script = _find_engram_hook_script(script_name)
+        if hook_script is None:
+            return None
 
         hook_script_str = str(hook_script).replace("\\", "\\\\")
         python_path_str = python_path.replace("\\", "\\\\")
-        engram_command = f'{python_path_str} "{hook_script_str}"'
+        # extra_env prefix — works in bash on macOS/Linux and is parsed by
+        # Claude Code's shell invocation on Windows under Git Bash. For
+        # cross-platform safety we encode the env hint inside the script
+        # via argv too (see below).
+        env_prefix = ""
+        if extra_env:
+            env_prefix = " ".join(
+                f'{k}={v}' for k, v in extra_env.items()
+            ) + " "
+        engram_command = f'{env_prefix}{python_path_str} "{hook_script_str}"'
 
-        # Read or create settings
         settings: dict = {}
         if settings_path.is_file():
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
 
         hooks = settings.setdefault("hooks", {})
-        stop_events = hooks.setdefault("Stop", [])
+        event_groups = hooks.setdefault(event, [])
 
-        # Check if engram hook already registered
-        for event_group in stop_events:
+        # Idempotency: skip if any group already has a hook matching markers.
+        for event_group in event_groups:
             for hook in event_group.get("hooks", []):
                 cmd = hook.get("command", "")
-                if "auto_save_on_stop" in cmd or "piia_engram" in cmd:
+                if any(kw in cmd for kw in marker_keywords):
                     return None  # Already registered
 
-        # Add the hook
         engram_hook = {
             "type": "command",
             "command": engram_command,
-            "timeout": 30,
+            "timeout": timeout,
             "async": True,
-            "statusMessage": "Engram 会话自动保存...",
+            "statusMessage": status_message,
         }
 
-        if stop_events:
-            # Append to existing first event group
-            stop_events[0].setdefault("hooks", []).append(engram_hook)
+        if event_groups:
+            event_groups[0].setdefault("hooks", []).append(engram_hook)
         else:
-            stop_events.append({"hooks": [engram_hook]})
+            event_groups.append({"hooks": [engram_hook]})
 
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(
@@ -584,6 +620,76 @@ def _inject_claude_code_hook(python_path: str) -> str | None:
 
     except Exception:
         return None
+
+
+def _inject_claude_code_hook(python_path: str) -> str | None:
+    """Register Engram Stop hook in Claude Code settings.json.
+
+    Adds the auto_save_on_stop.py hook to Claude Code's Stop event.
+    Idempotent: skips if engram hook already registered.
+
+    Returns the settings path if injected, None otherwise.
+    """
+    return _inject_claude_code_hook_for_event(
+        python_path,
+        event="Stop",
+        script_name="auto_save_on_stop.py",
+        status_message="Engram 会话自动保存...",
+        timeout=30,
+        marker_keywords=("auto_save_on_stop", "piia_engram"),
+    )
+
+
+def _inject_claude_code_precompact_hook(python_path: str) -> str | None:
+    """v3.30 mechanism (4): register PreCompact hook with asymmetric threshold.
+
+    Fires before Claude Code auto-compacts the transcript, calling the same
+    auto_save_on_stop.py script but with MIN_TURNS_TO_FLUSH=5 (vs 1 for the
+    Stop hook). Asymmetric thresholds prevent short sessions from triggering
+    a flush at every minor compaction while still protecting long sessions
+    from losing pre-compact state.
+
+    Also sets ``CLAUDE_INVOKED_BY=engram_precompact`` so the script can
+    detect re-entry (the Claude Agent SDK inside the script would otherwise
+    re-fire SessionEnd/PreCompact in an infinite loop).
+    """
+    return _inject_claude_code_hook_for_event(
+        python_path,
+        event="PreCompact",
+        script_name="auto_save_on_stop.py",
+        status_message="Engram pre-compact 兜底保存...",
+        timeout=30,
+        extra_env={
+            "ENGRAM_MIN_TURNS_TO_FLUSH": "5",
+            "CLAUDE_INVOKED_BY": "engram_precompact",
+        },
+        marker_keywords=("CLAUDE_INVOKED_BY=engram_precompact",),
+    )
+
+
+def _inject_claude_code_sessionstart_hook(python_path: str) -> str | None:
+    """v3.30 mechanism (6): register SessionStart hook for resume_brief auto-inject.
+
+    Fires when Claude Code starts a new session. The hook script calls
+    ``mcp__engram__get_resume_brief`` and emits the result via the
+    ``hookSpecificOutput.additionalContext`` JSON protocol, which Claude
+    Code splices into the system prompt for the first user turn.
+
+    This is the "last mile" — without it the AI has to be *told* to call
+    get_resume_brief, defeating the "user does zero work" goal.
+    """
+    return _inject_claude_code_hook_for_event(
+        python_path,
+        event="SessionStart",
+        script_name="auto_inject_resume_brief.py",
+        status_message="Engram 接续简报注入...",
+        timeout=15,
+        extra_env={"CLAUDE_INVOKED_BY": "engram_session_start"},
+        marker_keywords=(
+            "auto_inject_resume_brief",
+            "CLAUDE_INVOKED_BY=engram_session_start",
+        ),
+    )
 
 
 # Tool-specific restart instructions (key = tool config key from _tool_configs)
@@ -1618,6 +1724,18 @@ def run_setup(advanced: bool = False) -> None:
             if hook_result:
                 print(_t(f"  🔗 已注册 Claude Code 会话结束 Hook：{hook_result}",
                          f"  🔗 Registered Claude Code Stop hook: {hook_result}"))
+            # v3.30 mechanism (4): PreCompact hook with MIN_TURNS=5 — fires
+            # before Claude Code auto-compacts the transcript, so long
+            # sessions don't lose pre-compact state.
+            pre_result = _inject_claude_code_precompact_hook(python_path)
+            if pre_result:
+                print(_t(f"  🔗 已注册 PreCompact 兜底 Hook（v3.30）",
+                         f"  🔗 Registered PreCompact safety-net hook (v3.30)"))
+            # v3.30 mechanism (6): SessionStart auto-inject resume brief.
+            ss_result = _inject_claude_code_sessionstart_hook(python_path)
+            if ss_result:
+                print(_t(f"  🔗 已注册 SessionStart 接续简报 Hook（v3.30）",
+                         f"  🔗 Registered SessionStart resume-brief hook (v3.30)"))
     print()
 
     # Step 2 — 录入身份信息

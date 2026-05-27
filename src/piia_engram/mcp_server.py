@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -107,6 +108,9 @@ class _SessionTracker:
     _MIN_CALLS = 2
 
     _CHECKPOINT_EVERY = 20  # interim save every N real tool calls
+    _DEFAULT_HEARTBEAT_INTERVAL = 300  # seconds — every 5 minutes by default
+    # Floor for heartbeat interval to prevent runaway CPU/IO (mostly for tests).
+    _MIN_HEARTBEAT_INTERVAL = 1
 
     def __init__(self) -> None:
         self.session_id = f"auto-{_dt.now().strftime('%Y-%m-%dT%H-%M-%S')}"
@@ -117,18 +121,106 @@ class _SessionTracker:
         self.saved = False
         self._real_call_count = 0       # non-cold-start call counter
         self._checkpoint_seq = 0        # checkpoint sequence number
+        # Time-based heartbeat (v3.30 mechanism 2):
+        # Background daemon thread saves a checkpoint every
+        # ENGRAM_HEARTBEAT_INTERVAL seconds (default 300) when there is
+        # unsaved activity. This guarantees crash-mid-session loses at most
+        # one interval's worth of progress, even if the process dies before
+        # atexit fires (SIGKILL, OOM, host crash). Set the env var to 0 to
+        # disable. _lock serializes record / _interim_save across threads.
+        self._lock = threading.Lock()
+        # _last_save_at sentinel: datetime.min means "never saved". Using a
+        # value strictly less than any future timestamp avoids a Windows
+        # gotcha: datetime.now() precision is ~15ms, so initializing
+        # _last_save_at = start_time and then calling record() inside the
+        # same scheduler tick yields _last_save_at == _last_activity_at,
+        # which the heartbeat would mis-read as "no new activity" and
+        # never fire the first checkpoint. datetime.min sidesteps that.
+        self._last_save_at = _dt.min
+        # Timestamp of the most recent record() call. Heartbeat compares this
+        # against _last_save_at to decide if a checkpoint is needed.
+        self._last_activity_at = self.start_time
+        self._heartbeat_interval = self._read_heartbeat_interval()
+        self._stop_event = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        if self._heartbeat_interval > 0:
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                name="engram-heartbeat",
+                daemon=True,
+            )
+            self._heartbeat_thread.start()
+
+    @staticmethod
+    def _read_heartbeat_interval() -> int:
+        """Parse ENGRAM_HEARTBEAT_INTERVAL env (seconds). 0 disables, default 300."""
+        raw = os.environ.get("ENGRAM_HEARTBEAT_INTERVAL")
+        if raw is None or raw.strip() == "":
+            return _SessionTracker._DEFAULT_HEARTBEAT_INTERVAL
+        try:
+            v = int(raw.strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid ENGRAM_HEARTBEAT_INTERVAL=%r; using default %ds",
+                raw, _SessionTracker._DEFAULT_HEARTBEAT_INTERVAL,
+            )
+            return _SessionTracker._DEFAULT_HEARTBEAT_INTERVAL
+        if v <= 0:
+            return 0  # disabled
+        return max(v, _SessionTracker._MIN_HEARTBEAT_INTERVAL)
 
     def record(self, tool_called: str, args_summary: str = "") -> None:
-        self.calls.append({
-            "tool_called": tool_called,
-            "timestamp": _dt.now().strftime("%H:%M:%S"),
-            "args_summary": args_summary,
-        })
-        if tool_called not in self._COLD_START_TOOLS:
-            self._real_call_count += 1
-            if (self._real_call_count % self._CHECKPOINT_EVERY == 0
-                    and self._real_call_count > 0):
-                self._interim_save()
+        with self._lock:
+            now = _dt.now()
+            self.calls.append({
+                "tool_called": tool_called,
+                "timestamp": now.strftime("%H:%M:%S"),
+                "args_summary": args_summary,
+            })
+            self._last_activity_at = now
+            trigger_checkpoint = False
+            if tool_called not in self._COLD_START_TOOLS:
+                self._real_call_count += 1
+                if (self._real_call_count % self._CHECKPOINT_EVERY == 0
+                        and self._real_call_count > 0):
+                    trigger_checkpoint = True
+            if trigger_checkpoint:
+                # Hold the lock through the save to keep counter and
+                # _last_save_at consistent with the snapshot contents.
+                self._interim_save_locked(reason="count")
+
+    def _heartbeat_loop(self) -> None:
+        """Daemon thread: periodically checkpoint when there is unsaved activity.
+
+        Wakes every _heartbeat_interval seconds. If new tool calls arrived
+        since the last save, takes the lock and writes a checkpoint. Stops
+        cleanly when _stop_event is set (auto_save) or when the process is
+        killed (daemon thread dies with the main thread).
+        """
+        interval = self._heartbeat_interval
+        if interval <= 0:
+            return
+        while not self._stop_event.wait(interval):
+            try:
+                with self._lock:
+                    if not self.calls:
+                        continue
+                    # >= is correct here because _last_save_at starts at
+                    # datetime.min (see __init__), so the initial state
+                    # _last_save_at (min) >= _last_activity_at (start_time)
+                    # is False → first heartbeat fires correctly. After a
+                    # save, _last_save_at is strictly greater than the
+                    # _last_activity_at it captured, so subsequent idle
+                    # ticks skip cleanly.
+                    if self._last_save_at >= self._last_activity_at:
+                        # No new record() since last save — skip the tick so
+                        # idle sessions don't accumulate redundant checkpoint
+                        # files every interval.
+                        continue
+                    self._interim_save_locked(reason="heartbeat")
+            except Exception as exc:
+                # Best-effort: heartbeat must never crash the host process.
+                logger.debug("heartbeat checkpoint failed: %s", exc)
 
     def detect_tool(self, tool: str) -> None:
         if not self.tool_name and tool:
@@ -139,7 +231,25 @@ class _SessionTracker:
             self.project_folder = folder
 
     def _interim_save(self) -> None:
-        """Save a mid-session checkpoint without marking session as done."""
+        """Save a mid-session checkpoint without marking session as done.
+
+        Thin wrapper that acquires the lock. Internal callers that already
+        hold the lock (record, heartbeat loop) should call
+        _interim_save_locked() directly.
+        """
+        with self._lock:
+            self._interim_save_locked(reason="manual")
+
+    def _interim_save_locked(self, reason: str = "count") -> None:
+        """Same as _interim_save but the caller must hold self._lock.
+
+        Args:
+            reason: short tag included in the checkpoint header so we can
+                tell apart call-count vs time-heartbeat vs manual saves
+                when auditing ~/.engram/contexts/. Values: ``count`` (every
+                CHECKPOINT_EVERY calls), ``heartbeat`` (time-based), or
+                ``manual``.
+        """
         self._checkpoint_seq += 1
         tool = self.tool_name or "mcp_auto"
         duration = max(1, int((_dt.now() - self.start_time).total_seconds() / 60))
@@ -149,7 +259,8 @@ class _SessionTracker:
             seen.setdefault(c["tool_called"], None)
 
         content = (
-            f"[中间检查点 #{self._checkpoint_seq}] 会话时长: {duration} 分钟\n"
+            f"[中间检查点 #{self._checkpoint_seq}] 触发: {reason} · "
+            f"会话时长: {duration} 分钟\n"
             f"工具调用次数: {len(self.calls)}\n"
             f"使用的工具: {', '.join(seen.keys())}\n"
         )
@@ -169,11 +280,18 @@ class _SessionTracker:
                 project_folder=self.project_folder,
                 actions=actions,
             )
+            # Only mark "saved" if the call succeeded — otherwise the
+            # heartbeat will retry on its next tick.
+            self._last_save_at = _dt.now()
         except Exception:
             pass  # silent — checkpoints are best-effort
 
     def auto_save(self) -> None:
         """Save accumulated session log. Called by atexit handler."""
+        # Stop the heartbeat thread first so it doesn't race the final save.
+        # daemon threads will be torn down with the process anyway, but
+        # signaling stop here lets the loop exit cleanly within one tick.
+        self._stop_event.set()
         if self.saved:
             return
         # Check minimum work threshold
@@ -307,9 +425,32 @@ def _collect_project_info(project_folder: str) -> dict:
 
 _session = _SessionTracker()
 
-# Register atexit handler: auto-save session first, then flush telemetry
+
+def _engram_clean_shutdown() -> None:
+    """v3.30 mechanism (1): auto-save + telemetry flush + mark clean exit.
+
+    Runs at atexit. The session_state.json mark is what doctor reads to
+    decide whether to surface "previous session ended unexpectedly". If
+    this function runs to completion, the next Engram() init will read
+    last_clean_exit=True and not warn.
+    """
+    try:
+        _session.auto_save()
+    except Exception:
+        pass
+    try:
+        _flush_telemetry(force=True)
+    except Exception:
+        pass
+    try:
+        _engram._mark_clean_exit(last_session_id=_session.session_id)
+    except Exception:
+        pass
+
+
+# Register atexit handler: auto-save session, flush telemetry, mark clean exit
 import atexit
-atexit.register(lambda: (_session.auto_save(), _flush_telemetry(force=True)))
+atexit.register(_engram_clean_shutdown)
 
 
 def _track(tool_name: str, success: bool = True, args_summary: str = "") -> None:
@@ -357,6 +498,8 @@ TIER1_TOOLS = frozenset({
     "save_project_snapshot",     # persist project state
     # Agent context recovery
     "get_recent_context",        # recover lost session context
+    "get_daily_log",             # v3.30: human-readable per-project day timeline
+    "get_resume_brief",          # v3.30: cross-session/cross-tool resume brief
     # Diagnostics
     "doctor",                    # memory system self-diagnosis
 })
@@ -2160,6 +2303,40 @@ async def wrap_up_session(
             logger.warning("save_project_snapshot failed: %s", exc)
             results["project_snapshot"] = {"error": str(exc)}
 
+    # Step 2.5: Append human-readable entry to today's daily log
+    # (v3.30 mechanism 5). Always-on, lossy-safe single-file append per
+    # (project, day). Falls back to "(no-project)" bucket if no folder.
+    try:
+        daily_target = project_folder or "(no-project)"
+        # Keep the daily entry compact — first ~600 chars of the summary
+        # plus a one-line tally is enough for "what happened today" recall.
+        ins = results.get("insights") or {}
+        tally_parts = []
+        if isinstance(ins, dict):
+            if ins.get("saved_lessons"):
+                tally_parts.append(f"lessons={len(ins['saved_lessons'])}")
+            if ins.get("saved_decisions"):
+                tally_parts.append(f"decisions={len(ins['saved_decisions'])}")
+        if "playbook_draft" in results:
+            tally_parts.append("playbook=draft")
+        tally = " · ".join(tally_parts) if tally_parts else "no-new-knowledge"
+        body = summary.strip()
+        if len(body) > 600:
+            body = body[:600].rstrip() + "…"
+        daily_content = f"_{tally}_\n\n{body}"
+        daily_result = _engram.append_daily_log(
+            project_folder=daily_target,
+            content=daily_content,
+            event_type="session",
+            source_tool=source_tool,
+        )
+        results["daily_log"] = {
+            "file": daily_result["file"],
+            "created": daily_result["created"],
+        }
+    except Exception as exc:
+        logger.warning("append_daily_log failed: %s", exc)
+
     # Step 3: Auto-reconcile external AI memories and configs
     _reconcile_imported = 0
     try:
@@ -2375,6 +2552,29 @@ async def doctor(output_format: str = "markdown") -> str:
         "status": "PASS" if health >= 70 else "WARN",
         "detail": f"{health}/100" + (f" ({dim_breakdown})" if dim_breakdown else ""),
     })
+
+    # 8.5 v3.30 mechanism (1): unclean-exit detection
+    try:
+        unclean = getattr(_engram, "_prev_unclean", None) or _engram.get_unclean_exit_marker()
+    except Exception:
+        unclean = None
+    if unclean:
+        last_seen = unclean.get("last_seen_at", "")
+        pid = unclean.get("pid", "?")
+        checks.append({
+            "name": "unclean_exit",
+            "status": "WARN",
+            "detail": (
+                f"上次会话异常退出 (pid={pid}, last_seen={last_seen}). "
+                "进度可能丢失了 heartbeat 间隔内的内容（默认 5 分钟）。"
+            ),
+        })
+    else:
+        checks.append({
+            "name": "unclean_exit",
+            "status": "PASS",
+            "detail": "上次会话正常退出",
+        })
 
     # 8. Quick context freshness
     qc_path = _engram.root / "quick_context.md"
@@ -2601,6 +2801,73 @@ async def list_agent_sessions(
     sessions = _engram.list_agent_sessions(tool=tool, limit=limit)
     _track("list_agent_sessions", success=True)
     return _json({"sessions": sessions, "total": len(sessions)})
+
+
+@mcp.tool()
+async def get_resume_brief(
+    project_folder: str = "",
+    token_budget: int = 2000,
+) -> str:
+    """跨会话/跨工具接续简报（v3.30 新增）。 / Cross-session, cross-tool resume brief.
+
+    **用途：v3.30 行业首家"一次调用拿到完整接续简报"的高层 API。**
+    用户切换工具（Claude Code → Codex/Cursor）或开新对话时，AI 调用本工具
+    一次即可拿到：用户身份 + 当前项目状态 + 今日日志 + 最近会话上下文 +
+    最近经验/决策 + 建议阅读的项目文档清单。结果用
+    ``<engram-resume priority="high">`` XML 标签包裹，提示客户端 AI 优先遵守。
+
+    Purpose (v3.30): the "what does the next AI need to know in 30 seconds"
+    high-level endpoint. When users switch tools or open a new chat,
+    calling this once returns identity + project state + today's daily log
+    + recent context + top lessons/decisions + suggested project docs to
+    read. Result is wrapped in ``<engram-resume priority="high">`` so client
+    AIs (Claude Code additionalContext, Codex system prompt, etc.) treat
+    it as authoritative.
+
+    Lifecycle: **session start** — call before the first user message in a
+    new session when continuing prior work, or whenever the user says
+    things like "接着上次", "继续之前", "what were we doing".
+
+    Args:
+        project_folder: 项目文件夹路径（可选）。留空只返回身份卡。 /
+            Project folder (optional). Empty returns identity-only.
+        token_budget: 输出 token 软上限（默认 2000，约 8000 字符）。 /
+            Soft cap for output tokens (default 2000 ≈ 8000 chars).
+    """
+    brief = _engram.get_resume_brief(
+        project_folder=project_folder,
+        token_budget=token_budget,
+    )
+    _track("get_resume_brief", success=True)
+    return _json(brief)
+
+
+@mcp.tool()
+async def get_daily_log(
+    project_folder: str,
+    date: str = "",
+) -> str:
+    """读取项目的每日日志（人类可读的会话时间线）。 / Read a project's daily log (human-readable session timeline).
+
+    用途：v3.30 新增——每次 wrap_up_session 会在 ``~/.engram/daily/<pid>/<YYYY-MM-DD>.md``
+    追加一条带时间戳的条目（含 lesson/decision/playbook 计数 + 摘要前 600 字符）。
+    新会话需要"上次到底干了什么"的快速概览时调本工具，比 search_knowledge 更直观。
+    Purpose (v3.30): every wrap_up_session appends a timestamped entry to
+    ``~/.engram/daily/<pid>/<YYYY-MM-DD>.md`` with a lesson/decision tally
+    and the first ~600 chars of the summary. Call this when a new session
+    needs a glance-able "what happened today" timeline — faster than
+    search_knowledge for recall.
+
+    Args:
+        project_folder: 项目文件夹路径。 / Project folder path.
+        date: ISO 日期 ``YYYY-MM-DD``（可选，默认今天）。 / ISO date (optional, defaults to today).
+    """
+    log = _engram.get_daily_log(
+        project_folder=project_folder,
+        date=date or None,
+    )
+    _track("get_daily_log", success=True)
+    return _json(log)
 
 
 # Apply tool tier filter AFTER all @mcp.tool() decorators have run

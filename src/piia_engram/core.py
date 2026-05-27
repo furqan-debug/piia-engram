@@ -110,6 +110,99 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
 
         self._ensure_structure()
 
+        # v3.30 mechanism (1): unclean-exit detection.
+        # Each Engram() init stamps session_state.json with current pid +
+        # last_clean_exit=False. Normal shutdown rewrites it with True
+        # via _mark_clean_exit. If a later instance sees the previous
+        # state was last_clean_exit=False, doctor (mechanism 1) surfaces
+        # "previous session may have ended unexpectedly". This is the
+        # crash-recovery user-visible signal — the data itself is already
+        # safe thanks to _atomic_write_json + portalocker.
+        try:
+            self._mark_session_start()
+        except Exception:
+            pass  # Best-effort; never block init.
+
+    @property
+    def _session_state_path(self) -> Path:
+        return self.root / "session_state.json"
+
+    def get_unclean_exit_marker(self) -> dict | None:
+        """Return the prior session's state iff it ended uncleanly.
+
+        Returns None when:
+        - no prior state exists (fresh install or first run after migration);
+        - prior state recorded a clean exit (last_clean_exit=True);
+        - the stored pid is the CURRENT process (so we never mis-report
+          our own in-progress session as "unclean" — only the previous
+          process's leftover state qualifies).
+
+        Returns a dict with ``pid``, ``started_at``, ``last_seen_at``,
+        ``last_session_id`` when the previous session ended without
+        ``_mark_clean_exit`` firing (process killed, OS crashed, etc.).
+        Doctor surfaces this so the user knows a checkpoint may have
+        been lost (limited to the heartbeat interval, mechanism 2).
+        """
+        try:
+            data = _read_json(self._session_state_path)
+            if not isinstance(data, dict):
+                return None
+            if data.get("last_clean_exit"):
+                return None
+            pid = data.get("pid")
+            if not pid:
+                return None
+            # The "in-progress current session" must not be reported as
+            # unclean — that's the breadcrumb _mark_session_start just
+            # wrote 1ms ago, not a kill survivor.
+            if pid == os.getpid():
+                return None
+            return {
+                "pid": pid,
+                "started_at": data.get("started_at", ""),
+                "last_seen_at": data.get("last_seen_at", ""),
+                "last_session_id": data.get("last_session_id", ""),
+            }
+        except Exception:
+            return None
+
+    def _mark_session_start(self) -> None:
+        """Stamp session_state.json with the new session's metadata."""
+        # We deliberately don't preserve the previous file: get_unclean_exit_marker
+        # is meant to be called once per init (before we overwrite the file).
+        # Callers that need to surface the warning must do so on init.
+        self._prev_unclean = self.get_unclean_exit_marker()
+        payload = {
+            "pid": os.getpid(),
+            "started_at": _now_iso(),
+            "last_seen_at": _now_iso(),
+            "last_clean_exit": False,
+            "last_session_id": "",
+        }
+        try:
+            _write_json(self._session_state_path, payload)
+        except Exception:
+            pass
+
+    def _mark_clean_exit(self, last_session_id: str = "") -> None:
+        """Stamp session_state.json with last_clean_exit=True on graceful shutdown.
+
+        Called from the mcp_server atexit handler. Safe to call multiple
+        times — last write wins.
+        """
+        try:
+            data = _read_json(self._session_state_path)
+            if not isinstance(data, dict):
+                data = {}
+            data.update({
+                "last_clean_exit": True,
+                "last_seen_at": _now_iso(),
+                "last_session_id": last_session_id,
+            })
+            _write_json(self._session_state_path, data)
+        except Exception:
+            pass
+
     def _ensure_structure(self) -> None:
         """Create directory structure if it doesn't exist."""
         for sub in ["identity", "knowledge", "playbooks", "projects", "exports", "compat", "contexts", "environment"]:

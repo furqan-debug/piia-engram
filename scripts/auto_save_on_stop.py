@@ -27,12 +27,42 @@ Usage in Claude Code settings.json:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 
+def _flush_threshold() -> int:
+    """v3.30: read ENGRAM_MIN_TURNS_TO_FLUSH (default 10).
+
+    The PreCompact hook (mechanism 4) sets this to 5 so short sessions
+    skip flush at every minor auto-compaction. The Stop hook leaves the
+    default 10 because a session that finished organically deserves a
+    flush regardless of length.
+    """
+    raw = os.environ.get("ENGRAM_MIN_TURNS_TO_FLUSH", "10")
+    try:
+        return max(1, int(raw.strip()))
+    except (TypeError, ValueError):
+        return 10
+
+
 def main() -> None:
+    # v3.30 mechanism (4): re-entry guard. The Claude Agent SDK invocation
+    # we trigger below can itself fire SessionEnd/PreCompact in a child
+    # process, which would loop infinitely. CLAUDE_INVOKED_BY=engram_*
+    # is set by the parent hook command (and by flush.py in the
+    # claude-memory-compiler design we borrowed this pattern from).
+    if os.environ.get("CLAUDE_INVOKED_BY", "").startswith("engram_"):
+        # Specifically allow precompact / session_start sentinels through —
+        # those are intentional outer triggers. We only bail on a recursive
+        # chain where engram already spawned a child that re-fires us.
+        if os.environ.get("CLAUDE_INVOKED_BY") == "engram_recursive":
+            return
+        # Tag downstream invocations so any deeper child can detect the chain.
+        os.environ["CLAUDE_INVOKED_BY"] = "engram_recursive"
+
     # Read hook input from stdin
     try:
         raw = sys.stdin.read()
@@ -87,8 +117,10 @@ def main() -> None:
         except OSError:
             pass
 
-    # Don't save trivially short sessions
-    if msg_count < 4:
+    # Don't save trivially short sessions. Threshold is env-configurable
+    # so PreCompact hook can raise it (v3.30 mechanism 4).
+    min_save_threshold = max(4, _flush_threshold() // 2)
+    if msg_count < min_save_threshold:
         return
 
     # Calculate duration
@@ -146,8 +178,10 @@ def main() -> None:
         )
 
         # Extract lessons/decisions/playbook drafts into staging
-        # Only for substantial sessions (10+ messages indicate real work)
-        if msg_count >= 10:
+        # Only for substantial sessions. Default 10 messages; PreCompact
+        # hook lowers to 5 via ENGRAM_MIN_TURNS_TO_FLUSH so long sessions
+        # that hit auto-compaction still get a tier-1 flush.
+        if msg_count >= _flush_threshold():
             summary = f"Claude Code 会话 ({duration_str}, {msg_count} 消息)\n"
             summary += f"工作目录: {cwd}\n"
             if tool_calls:
