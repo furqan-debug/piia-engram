@@ -4,6 +4,38 @@ All notable changes to Engram are documented in this file. For detailed release 
 
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [3.29.4] - 2026-05-27
+
+跨工具/跨会话审计驱动的优化版本。R1/R2/R3 三轮回归全部通过。
+
+### Added
+- **`doctor` MCP 工具**：用户排障入口，覆盖 8 项检查（identity_completeness, health_score, stale_knowledge, near_duplicates, decision_conflicts, knowledge_volume, quick_context_freshness, identity_provenance）。默认包含在 core tier 中。
+- **字段级溯源**：profile 现在记录每个字段的 `_provenance: {by, at}` 以及 `_last_updated_by`，便于跨工具排查"谁动了我的偏好"。
+- **`update_identity` MCP 增加 `source_tool` 参数**：传入即可在 profile 中留下来源记录。
+- **类型感知的过期衰减**：`STALE_DECAY_MULTIPLIERS` 按 domain 调整过期门槛（`user_preference=3.0`、`architecture=2.0`、`workflow=1.0`、`debug=0.5`），避免长期偏好被错误判过期。
+- **跨工具使用指南**：新增 `docs/cross-tool-guide.md`，覆盖配置、自动恢复、多工具共存、doctor 排障流程。
+- **R3 守门测试**：`tests/test_optimizations_v3294.py` 固化 6 项关键回归（description 重写、三工具共存、decision 无自指、lesson 无自指、doctor core）。
+
+### Changed
+- **Lesson/Decision 三级去重**（duplicate / related / pass）：
+  - `SIMILARITY_DUPLICATE_THRESHOLD` 从 0.85 提高到 0.95，避免"补充案例"被误判为 duplicate。
+  - 引入 `_SUPPLEMENT_MARKERS`（含 `补充/案例/反例/边界/edge case` 等），即使相似度高也允许走 related。
+  - 0.55 ≤ sim < 0.95 的条目会双向写入 `related_ids`，并附 `_dedup_note`。
+- **Decision ID 生成**：ID seed 现在包含 `choice`，避免"同问题不同选项"产生相同 ID。
+- **Description 字段级合并**：多工具写入的 marker 共存；重写已存在的 marker 时不会丢失其他工具的写入。
+- **`get_lessons` / `get_decisions` 默认不更新 access_count**：identity card 等读路径不再产生副作用。
+- **`related_ids` 自指守卫**：lesson / decision 关联时跳过自身 ID，避免 `related_ids: [self]`。
+
+### Fixed
+- R1: `doctor` 调用不存在的 `knowledge_overview` 方法 → 改用 `get_knowledge_overview()`。
+- R2: 重复写已有 description marker 时其他工具的 marker 被覆盖。
+- R2: 同问题不同 choice 的决策 `related_ids` 出现自指。
+
+### Release Evidence
+- `experiments/memory_audit/results/optimization_verify_report.md` (R1: 16/18)
+- `experiments/memory_audit/results/optimization_verify_r2_report.md` (R2: 22/22)
+- `experiments/memory_audit/results/optimization_verify_r3_report.md` (R3: 6/6)
+
 ## [3.29.0] - 2026-05-24
 
 AI instruction auto-injection, hooks adapter, activation funnel, competitive scan.

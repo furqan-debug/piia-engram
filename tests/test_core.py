@@ -273,10 +273,10 @@ def test_update_and_archive_lesson(tmp_path: Path):
 
 
 def test_duplicate_detection(tmp_path: Path):
-    """相似经验不应重复写入。"""
+    """精确重复的经验应被识别为 duplicate（阈值 0.95）。"""
     engram = make_engram(tmp_path)
     first = engram.add_lesson("Python 虚拟环境避免全局依赖冲突", "python")
-    duplicate = engram.add_lesson("Python 虚拟环境避免依赖冲突问题", "python")
+    duplicate = engram.add_lesson("Python 虚拟环境避免全局依赖冲突", "python")
 
     assert first.get("status") == "active"
     assert duplicate.get("status") == "duplicate"

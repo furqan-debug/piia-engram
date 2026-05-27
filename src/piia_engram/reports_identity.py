@@ -101,7 +101,7 @@ class IdentityCardMixin:
                 lines.append(f"- ...{lbl}")
             lines.append("")
 
-        lessons = self.get_lessons(limit=30)
+        lessons = self.get_lessons(limit=30, _update_access=False)
         if lessons:
             filtered = []
             for l in lessons:

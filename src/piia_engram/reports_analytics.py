@@ -12,6 +12,7 @@ from .storage import (
     MAX_KNOWLEDGE_ENTRIES,
     SCHEMA_VERSION,
     STALE_KNOWLEDGE_DAYS,
+    STALE_DECAY_MULTIPLIERS,
     _parse_iso,
 )
 
@@ -66,8 +67,7 @@ class AnalyticsMixin:
         if outdated_lessons:
             warnings.append(f"{len(outdated_lessons)} 条教训已标记过时，可考虑清理")
 
-        review_cutoff = datetime.now() - timedelta(days=STALE_KNOWLEDGE_DAYS)
-        archive_cutoff = datetime.now() - timedelta(days=60)
+        now = datetime.now()
         lifecycle_items = [
             ("lesson", item)
             for item in active_lessons
@@ -81,6 +81,16 @@ class AnalyticsMixin:
             reviewed_at = self._reviewed_at(item)
             if not reviewed_at:
                 continue
+            # Type-aware stale decay: match domain to decay multiplier
+            domain = (item.get("domain") or "").split(",")[0].strip().lower()
+            multiplier = STALE_DECAY_MULTIPLIERS.get(
+                domain, STALE_DECAY_MULTIPLIERS["default"]
+            )
+            review_days = int(STALE_KNOWLEDGE_DAYS * multiplier)
+            archive_days = int(review_days * 2)
+            review_cutoff = now - timedelta(days=review_days)
+            archive_cutoff = now - timedelta(days=archive_days)
+
             view = self._lifecycle_review_view(item_type, item)
             if item.get("access_count", 0) >= 3 and reviewed_at <= review_cutoff:
                 items_needing_review.append(view)

@@ -36,6 +36,7 @@ CORE_MCP_TOOLS = {
     "get_project_context",
     "save_project_snapshot",
     "get_recent_context",
+    "doctor",
 }
 
 

@@ -24,9 +24,28 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = "2.0"
 _ENGRAM_DIR_NAME = ".engram"
 _LEGACY_DIR_NAME = ".piia"
-SIMILARITY_THRESHOLD = 0.55
+SIMILARITY_THRESHOLD = 0.55          # below this: pass; above: related or duplicate
+SIMILARITY_DUPLICATE_THRESHOLD = 0.95  # at or above: exact duplicate, reject
+# Keywords that signal supplement/extension, NOT duplication — demote to "related"
+_SUPPLEMENT_MARKERS = frozenset({
+    "补充", "案例", "更新", "反例", "边界", "延伸", "扩展", "修正",
+    "补充说明", "特殊情况", "例外", "进阶", "深入", "实战",
+    "supplement", "update", "addendum", "edge case", "exception",
+    "extension", "advanced", "follow-up", "correction", "counterexample",
+})
 SEARCH_RELEVANCE_THRESHOLD = 0.3   # minimum score for search results
 STALE_KNOWLEDGE_DAYS = 30          # days without access before knowledge is "stale"
+# Type-aware stale decay multipliers (applied to STALE_KNOWLEDGE_DAYS)
+STALE_DECAY_MULTIPLIERS: dict[str, float] = {
+    "user_preference": 3.0,    # 90 days — user preferences decay slowly
+    "architecture": 2.0,       # 60 days — architecture decisions are long-lived
+    "strategy": 2.0,           # 60 days — strategic decisions
+    "product": 1.5,            # 45 days — product decisions
+    "workflow": 1.0,           # 30 days — workflow/process (default)
+    "debug": 0.5,              # 15 days — debugging workarounds decay fast
+    "config": 0.5,             # 15 days — config/setup issues
+    "default": 1.0,            # 30 days — everything else
+}
 MAX_KNOWLEDGE_ENTRIES = 200        # cap per knowledge type (lessons / decisions)
 CONFLICT_Q_THRESHOLD = 0.25   # question similarity for potential decision conflict
 CONFLICT_C_CEILING = 0.80     # choice similarity ceiling — above means same choice, not conflict

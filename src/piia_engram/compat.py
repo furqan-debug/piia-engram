@@ -172,7 +172,7 @@ def export_to_openclaw(engram: "Engram", output_dir: str) -> dict:
     # --- MEMORY.md: Long-term memory (lessons + decisions) ---
     memory_lines = ["# MEMORY", ""]
 
-    lessons = engram.get_lessons(limit=50)
+    lessons = engram.get_lessons(limit=50, _update_access=False)
     if lessons:
         memory_lines.append("## Lessons Learned")
         for l in lessons:
@@ -181,7 +181,7 @@ def export_to_openclaw(engram: "Engram", output_dir: str) -> dict:
             memory_lines.append(f"- {prefix}{l.get('summary', '')}")
         memory_lines.append("")
 
-    decisions = engram.get_decisions(limit=30)
+    decisions = engram.get_decisions(limit=30, _update_access=False)
     if decisions:
         memory_lines.append("## Key Decisions")
         for d in decisions:
@@ -286,7 +286,7 @@ def import_from_openclaw(
         if p.is_file():
             content = p.read_text(encoding="utf-8")
             existing_summaries = {
-                l.get("summary", "") for l in engram.get_lessons(limit=MAX_KNOWLEDGE_ENTRIES)
+                l.get("summary", "") for l in engram.get_lessons(limit=MAX_KNOWLEDGE_ENTRIES, _update_access=False)
             }
             new_count = 0
             current_section = ""

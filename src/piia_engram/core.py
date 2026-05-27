@@ -28,7 +28,9 @@ from .storage import (  # noqa: F401 — re-exports
     PLAYBOOK_TRIGGERS,
     SCHEMA_VERSION,
     SEARCH_RELEVANCE_THRESHOLD,
+    SIMILARITY_DUPLICATE_THRESHOLD,
     SIMILARITY_THRESHOLD,
+    _SUPPLEMENT_MARKERS,
     STALE_KNOWLEDGE_DAYS,
     TOOL_CATEGORIES,
     _AFFIRMATION_MARKERS,
@@ -225,8 +227,16 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
         filtered = {k: v for k, v in updates.items() if k in allowed}
         return filtered, rejected
 
-    def update_profile(self, updates: dict) -> None:
-        """Merge updates into the user profile."""
+    def update_profile(self, updates: dict, source_tool: str = "") -> None:
+        """Merge updates into the user profile.
+
+        ``description`` uses append semantics: new tokens that are not
+        already present are appended so that markers from multiple tools
+        coexist rather than overwriting each other.
+
+        Field-level provenance is tracked in ``_provenance`` so callers
+        can determine which tool last touched each field.
+        """
         updates, rejected = self._filter_allowed(updates, _ALLOWED_PROFILE_FIELDS)
         if rejected:
             self._audit.log("warn", "identity/profile",
@@ -234,8 +244,36 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
         if not updates:
             return
         profile = self.get_profile()
+
+        # Description: append-merge to preserve multi-tool markers
+        if "description" in updates and profile.get("description"):
+            old_desc = profile["description"]
+            new_desc = updates["description"]
+            if not new_desc:
+                # Empty update — keep existing
+                updates["description"] = old_desc
+            else:
+                existing_parts = set(old_desc.split())
+                new_parts = [p for p in new_desc.split() if p not in existing_parts]
+                if new_parts:
+                    updates["description"] = old_desc + " " + " ".join(new_parts)
+                else:
+                    # All tokens already present — keep existing unchanged
+                    updates["description"] = old_desc
+
+        now = _now_iso()
+
+        # Track field-level provenance
+        provenance = profile.get("_provenance", {})
+        for key in updates:
+            if key not in ("updated_at",):
+                provenance[key] = {"by": source_tool or "unknown", "at": now}
+
         profile.update(updates)
-        profile["updated_at"] = _now_iso()
+        profile["updated_at"] = now
+        profile["_provenance"] = provenance
+        if source_tool:
+            profile["_last_updated_by"] = source_tool
         encrypted = self._crypto.encrypt_fields(profile, ENCRYPTED_PROFILE_FIELDS)
         _write_json(self._identity_dir / "profile.json", encrypted)
         self._audit.log("write", "identity/profile", detail=str(list(updates.keys())))
@@ -348,6 +386,8 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
             identity = self._entry_identity_text(entry, entry_type)
             if entry_type == "lesson":
                 seed = f"{identity}{entry.get('domain', '')}{entry.get('timestamp', '')}"
+            elif entry_type == "decision":
+                seed = f"{identity}{entry.get('choice', '')}{entry.get('timestamp', '')}"
             else:
                 seed = f"{identity}{entry.get('timestamp', '')}"
             entry["id"] = hashlib.sha256(seed.encode()).hexdigest()[:12]
@@ -416,6 +456,9 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
         new_lesson["timestamp"] = new_lesson.get("timestamp") or _now_iso()
         new_lesson = self._ensure_fields(new_lesson, "lesson")
 
+        # Three-tier dedup: exact duplicate / semantically related / pass
+        best_sim = 0.0
+        best_match = None
         for existing in lessons:
             existing = self._ensure_fields(existing, "lesson")
             if existing.get("status") != "active":
@@ -424,14 +467,40 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
                 new_lesson.get("summary", ""),
                 existing.get("summary", ""),
             )
-            if sim >= SIMILARITY_THRESHOLD:
+            if sim > best_sim:
+                best_sim = sim
+                best_match = existing
+
+        if best_sim >= SIMILARITY_DUPLICATE_THRESHOLD and best_match:
+            # Check for supplement markers — demote to related if new text
+            # signals extension/supplement rather than true duplication
+            new_summary_lower = new_lesson.get("summary", "").lower()
+            existing_summary_lower = (best_match.get("summary") or "").lower()
+            has_supplement_signal = any(
+                marker in new_summary_lower and marker not in existing_summary_lower
+                for marker in _SUPPLEMENT_MARKERS
+            )
+            if not has_supplement_signal:
+                # Tier 1: exact duplicate — reject
                 return {
                     "status": "duplicate",
-                    "similarity": round(sim, 2),
-                    "existing_id": existing.get("id"),
-                    "existing_summary": existing.get("summary"),
-                    "message": f"与现有教训相似度 {sim:.0%}，未重复添加",
+                    "similarity": round(best_sim, 2),
+                    "existing_id": best_match.get("id"),
+                    "existing_summary": best_match.get("summary"),
+                    "message": f"与现有教训相似度 {best_sim:.0%}，未重复添加",
                 }
+            # Supplement signal detected — fall through to related tier
+
+        if best_sim >= SIMILARITY_THRESHOLD and best_match:
+            # Tier 2: semantically related — add but link
+            new_id = new_lesson.get("id", "")
+            existing_id = best_match.get("id", "")
+            # Guard against self-reference
+            if existing_id and existing_id != new_id and existing_id not in new_lesson.get("related_ids", []):
+                new_lesson.setdefault("related_ids", []).append(existing_id)
+            if new_id and new_id != existing_id and new_id not in best_match.get("related_ids", []):
+                best_match.setdefault("related_ids", []).append(new_id)
+            new_lesson["_dedup_note"] = f"related to {existing_id} (sim={best_sim:.0%})"
 
         lessons.append(new_lesson)
         if len(lessons) > MAX_KNOWLEDGE_ENTRIES:
@@ -549,6 +618,9 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
         new_decision = self._ensure_fields(new_decision, "decision")
 
         new_title = self._entry_identity_text(new_decision, "decision")
+        # Three-tier dedup for decisions
+        best_sim = 0.0
+        best_match = None
         for existing in decisions:
             existing = self._ensure_fields(existing, "decision")
             if existing.get("status") != "active":
@@ -557,14 +629,40 @@ class Engram(RetrievalMixin, ContextMixin, ReconcileMixin, ReportsMixin, Context
                 new_title,
                 self._entry_identity_text(existing, "decision"),
             )
-            if sim >= SIMILARITY_THRESHOLD:
+            if sim > best_sim:
+                best_sim = sim
+                best_match = existing
+
+        if best_sim >= SIMILARITY_DUPLICATE_THRESHOLD and best_match:
+            # For decisions: different choice on same question = conflict, not duplicate
+            new_choice = (new_decision.get("choice") or "").strip().lower()
+            existing_choice = (best_match.get("choice") or "").strip().lower()
+            choices_differ = new_choice and existing_choice and new_choice != existing_choice
+            new_title_lower = new_title.lower()
+            existing_title_lower = self._entry_identity_text(best_match, "decision").lower()
+            has_supplement = any(
+                m in new_title_lower and m not in existing_title_lower
+                for m in _SUPPLEMENT_MARKERS
+            )
+            if not choices_differ and not has_supplement:
                 return {
                     "status": "duplicate",
-                    "similarity": round(sim, 2),
-                    "existing_id": existing.get("id"),
-                    "existing_title": self._entry_identity_text(existing, "decision"),
-                    "message": f"与现有决策相似度 {sim:.0%}，未重复添加",
+                    "similarity": round(best_sim, 2),
+                    "existing_id": best_match.get("id"),
+                    "existing_title": self._entry_identity_text(best_match, "decision"),
+                    "message": f"与现有决策相似度 {best_sim:.0%}，未重复添加",
                 }
+            # Different choice or supplement — fall through to related tier
+
+        if best_sim >= SIMILARITY_THRESHOLD and best_match:
+            new_id = new_decision.get("id", "")
+            existing_id = best_match.get("id", "")
+            # Guard against self-reference
+            if existing_id and existing_id != new_id and existing_id not in new_decision.get("related_ids", []):
+                new_decision.setdefault("related_ids", []).append(existing_id)
+            if new_id and new_id != existing_id and new_id not in best_match.get("related_ids", []):
+                best_match.setdefault("related_ids", []).append(new_id)
+            new_decision["_dedup_note"] = f"related to {existing_id} (sim={best_sim:.0%})"
 
         decisions.append(new_decision)
         if len(decisions) > MAX_KNOWLEDGE_ENTRIES:

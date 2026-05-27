@@ -357,6 +357,8 @@ TIER1_TOOLS = frozenset({
     "save_project_snapshot",     # persist project state
     # Agent context recovery
     "get_recent_context",        # recover lost session context
+    # Diagnostics
+    "doctor",                    # memory system self-diagnosis
 })
 
 mcp = FastMCP(
@@ -1798,7 +1800,7 @@ async def unlink_knowledge(id_a: str, id_b: str) -> str:
 
 
 @mcp.tool()
-async def update_identity(field: str, updates_json: str) -> str:
+async def update_identity(field: str, updates_json: str, source_tool: str = "") -> str:
     """更新一个身份字段。 / Update one identity field.
 
     用途：需要修改 profile、preferences、trust_boundaries、work_style 或 quality_standards 时调用。
@@ -1810,6 +1812,7 @@ async def update_identity(field: str, updates_json: str) -> str:
     Args:
         field: 字段名：profile、preferences、trust_boundaries、work_style 或 quality_standards。 / Field name: profile, preferences, trust_boundaries, work_style, or quality_standards.
         updates_json: 包含要更新字段的 JSON 字符串。 / JSON string containing the fields to update.
+        source_tool: 调用来源工具（如 'claude_code', 'codex', 'cursor'），用于字段级溯源。 / Source tool for field-level provenance tracking.
 
     Field-specific keys / 字段专用键:
         profile: role, language, technical_level, description / role、language、technical_level、description。
@@ -1832,7 +1835,12 @@ async def update_identity(field: str, updates_json: str) -> str:
         "quality_standards": _engram.update_quality_standards,
     }
     try:
-        dispatch[field](updates)
+        fn = dispatch[field]
+        # Pass source_tool for provenance tracking (profile supports it)
+        if field == "profile" and source_tool:
+            fn(updates, source_tool=source_tool)
+        else:
+            fn(updates)
         _track("update_identity", success=True)
     except Exception as exc:
         _track("update_identity", success=False)
@@ -2266,6 +2274,138 @@ async def export_feedback_report() -> str:
     from piia_engram.setup_wizard import _build_feedback_report
     report = _build_feedback_report()
     return _json(report)
+
+
+@mcp.tool()
+async def doctor(output_format: str = "markdown") -> str:
+    """记忆系统自诊断。 / Memory system self-diagnosis.
+
+    用途：检查 Engram 记忆系统健康状态，发现潜在问题（数据碎片、过期知识、冲突决策、
+    身份层异常等）。等效于 ``piia-engram doctor``。
+    Purpose: Run a comprehensive health check on the Engram memory system —
+    detects data fragmentation, stale knowledge, conflicting decisions, identity
+    issues, and more.
+
+    Args:
+        output_format: "markdown" 或 "json"。 / "markdown" or "json".
+    """
+    from pathlib import Path as _Path
+    from datetime import datetime, timedelta
+
+    checks: list[dict] = []
+
+    # 1. Identity completeness
+    profile = _engram.get_profile()
+    missing_identity = [f for f in ("role", "language", "description") if not profile.get(f)]
+    checks.append({
+        "name": "identity_completeness",
+        "status": "WARN" if missing_identity else "PASS",
+        "detail": f"缺少字段: {missing_identity}" if missing_identity else "profile 完整",
+    })
+
+    # 2. Provenance tracking
+    has_prov = bool(profile.get("_provenance"))
+    checks.append({
+        "name": "identity_provenance",
+        "status": "PASS" if has_prov else "INFO",
+        "detail": "字段级溯源已启用" if has_prov else "无溯源数据（首次 update_profile 后自动生成）",
+    })
+
+    # 3. Knowledge counts
+    lessons = _engram.get_lessons(limit=None, _update_access=False)
+    decisions = _engram.get_decisions(limit=None, _update_access=False)
+    checks.append({
+        "name": "knowledge_volume",
+        "status": "PASS",
+        "detail": f"lessons={len(lessons)}, decisions={len(decisions)}",
+    })
+
+    # 4. Stale knowledge
+    overview = _engram.get_knowledge_overview()
+    stale = overview.get("lifecycle", {}).get("items_needing_review", [])
+    archive = overview.get("lifecycle", {}).get("items_to_archive", [])
+    checks.append({
+        "name": "stale_knowledge",
+        "status": "WARN" if len(stale) > 10 else "PASS",
+        "detail": f"需复审: {len(stale)}, 可归档: {len(archive)}",
+    })
+
+    # 5. Duplicate detection
+    from piia_engram.storage import SIMILARITY_THRESHOLD
+    dup_count = 0
+    for i, a in enumerate(lessons):
+        for b in lessons[i + 1:]:
+            sim = _engram._bigram_similarity(a.get("summary", ""), b.get("summary", ""))
+            if sim >= SIMILARITY_THRESHOLD:
+                dup_count += 1
+        if dup_count > 20:
+            break
+    checks.append({
+        "name": "near_duplicates",
+        "status": "WARN" if dup_count > 5 else "PASS",
+        "detail": f"近似重复对数: {dup_count}",
+    })
+
+    # 6. Conflicting decisions
+    try:
+        conflicts = _engram._detect_decision_conflicts(decisions)
+    except Exception:
+        conflicts = []
+    checks.append({
+        "name": "decision_conflicts",
+        "status": "WARN" if conflicts else "PASS",
+        "detail": f"冲突决策: {len(conflicts)} 对" if conflicts else "无冲突",
+    })
+
+    # 7. Health score
+    health = overview.get("health_score", 0)
+    checks.append({
+        "name": "health_score",
+        "status": "PASS" if health >= 70 else "WARN",
+        "detail": f"{health}/100",
+    })
+
+    # 8. Quick context freshness
+    qc_path = _engram.root / "quick_context.md"
+    if qc_path.exists():
+        age_hours = (datetime.now().timestamp() - qc_path.stat().st_mtime) / 3600
+        checks.append({
+            "name": "quick_context_freshness",
+            "status": "PASS" if age_hours < 24 else "WARN",
+            "detail": f"最后更新: {age_hours:.1f} 小时前",
+        })
+    else:
+        checks.append({
+            "name": "quick_context_freshness",
+            "status": "FAIL",
+            "detail": "quick_context.md 不存在",
+        })
+
+    passed = sum(1 for c in checks if c["status"] == "PASS")
+    warned = sum(1 for c in checks if c["status"] == "WARN")
+    failed = sum(1 for c in checks if c["status"] == "FAIL")
+
+    result = {
+        "summary": f"{passed} PASS, {warned} WARN, {failed} FAIL (共 {len(checks)} 项)",
+        "checks": checks,
+    }
+
+    if output_format == "json":
+        _track("doctor", success=True)
+        return _json(result)
+
+    # Markdown output
+    lines = ["# Engram Doctor Report", ""]
+    lines.append(f"**总结**: {result['summary']}")
+    lines.append("")
+    lines.append("| 检查项 | 状态 | 详情 |")
+    lines.append("|--------|------|------|")
+    for c in checks:
+        icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌", "INFO": "ℹ️"}.get(c["status"], "?")
+        lines.append(f"| {c['name']} | {icon} {c['status']} | {c['detail']} |")
+
+    _track("doctor", success=True)
+    return "\n".join(lines)
 
 
 @mcp.tool()
