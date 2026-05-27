@@ -21,12 +21,11 @@
 [![PyPI](https://img.shields.io/pypi/v/piia-engram)](https://pypi.org/project/piia-engram/)
 [![Downloads](https://img.shields.io/pypi/dm/piia-engram)](https://pypi.org/project/piia-engram/)
 [![Official MCP Registry](https://img.shields.io/badge/MCP_Registry-official-green.svg)](https://registry.modelcontextprotocol.io)
-[![Glama 评分: License A · Quality A · Maintenance A](https://glama.ai/mcp/servers/@Patdolitse/piia-engram/badge)](https://glama.ai/mcp/servers/@Patdolitse/piia-engram)
 
 **被收录于：**
 [![awesome-mcp-servers](https://img.shields.io/badge/listed_in-awesome--mcp--servers-orange?logo=awesome-lists)](https://github.com/punkpeye/awesome-mcp-servers)
 [![awesome-agents](https://img.shields.io/badge/listed_in-awesome--agents-orange?logo=awesome-lists)](https://github.com/kyrolabs/awesome-agents)
-[![Glama 目录](https://img.shields.io/badge/listed_in-Glama_MCP_目录-blue)](https://glama.ai/mcp/servers/@Patdolitse/piia-engram)
+[![Glama 目录](https://img.shields.io/badge/Glama_目录-3A_评级-blue)](https://glama.ai/mcp/servers/@Patdolitse/piia-engram)
 
 </div>
 
