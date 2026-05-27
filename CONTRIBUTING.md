@@ -95,6 +95,24 @@ security: enforce trust boundaries in identity card export
 
 PR titles should be under 70 characters. Use the description for details.
 
+## Good First Contributions
+
+These are good starting points for a first PR:
+
+- Improve setup or usage docs in [README.md](README.md) or [docs/cross-tool-guide.md](docs/cross-tool-guide.md)
+- Add a small regression test for an edge case in [tests/test_mcp_tools.py](tests/test_mcp_tools.py) or [tests/test_reconcile.py](tests/test_reconcile.py)
+- Clarify a command, example, or error message that is easy to misunderstand
+- Fix a typo, broken example, or confusing phrase in user-facing docs
+
+## First Contribution Checklist
+
+Before opening a PR, confirm that you have:
+
+- run `python -m pytest tests/ -v`
+- kept the change focused to one concern
+- added or updated tests when behavior changed
+- written a short PR description with the problem, fix, and verification steps
+
 ## Reporting Issues
 
 Please include:
