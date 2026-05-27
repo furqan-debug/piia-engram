@@ -21,6 +21,7 @@
 [![PyPI](https://img.shields.io/pypi/v/piia-engram)](https://pypi.org/project/piia-engram/)
 [![Downloads](https://img.shields.io/pypi/dm/piia-engram)](https://pypi.org/project/piia-engram/)
 [![Official MCP Registry](https://img.shields.io/badge/MCP_Registry-official-green.svg)](https://registry.modelcontextprotocol.io)
+[![Glama Score: License A · Quality A · Maintenance A](https://glama.ai/mcp/servers/@Patdolitse/piia-engram/badge)](https://glama.ai/mcp/servers/@Patdolitse/piia-engram)
 
 </div>
 
