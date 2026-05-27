@@ -7,6 +7,7 @@
   },
   "homepage": "https://github.com/Patdolitse/piia-engram",
   "license": "Apache-2.0",
+  "category": "knowledge",
   "keywords": [
     "memory",
     "identity",
