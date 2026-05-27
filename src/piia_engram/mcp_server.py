@@ -195,7 +195,13 @@ class _SessionTracker:
     def _heartbeat_tick(self) -> bool:
         """Run one heartbeat iteration synchronously.
 
-        Returns ``True`` iff a checkpoint was written this tick.
+        Returns ``True`` if a checkpoint save was **attempted** this tick
+        (i.e. there was unsaved activity and the save path was entered).
+        The return value does NOT distinguish success from failure —
+        ``_interim_save_locked`` is best-effort and swallows exceptions.
+        Use ``_saved_seq == _activity_seq`` to check whether the most
+        recent save actually landed.
+
         Extracted from ``_heartbeat_loop`` so tests can drive a single
         deterministic tick without ``time.sleep`` waits (H6). The
         decision uses the ``_activity_seq`` / ``_saved_seq`` counters
@@ -356,47 +362,51 @@ class _SessionTracker:
             return
         self.saved = True
 
-        tool = self.tool_name or "mcp_auto"
-        duration = max(1, int((_dt.now() - self.start_time).total_seconds() / 60))
+        # M2 fix: acquire the same lock the heartbeat thread uses so
+        # that even if join(timeout=3.0) expired and the thread is
+        # still alive, we serialize rather than race the final save.
+        with self._lock:
+            tool = self.tool_name or "mcp_auto"
+            duration = max(1, int((_dt.now() - self.start_time).total_seconds() / 60))
 
-        # Deduplicated tool list preserving order
-        seen: dict[str, None] = {}
-        for c in self.calls:
-            seen.setdefault(c["tool_called"], None)
-        unique_tools = list(seen.keys())
+            # Deduplicated tool list preserving order
+            seen: dict[str, None] = {}
+            for c in self.calls:
+                seen.setdefault(c["tool_called"], None)
+            unique_tools = list(seen.keys())
 
-        client_label = (
-            f"{self.client_info['name']} {self.client_info.get('version', '')}"
-            if self.client_info else ""
-        )
-        content = (
-            f"[MCP 自动记录] 会话时长: {duration} 分钟\n"
-            f"工具调用次数: {len(self.calls)}\n"
-            f"使用的工具: {', '.join(unique_tools)}\n"
-        )
-        if client_label:
-            content += f"MCP 客户端: {client_label}\n"
-
-        # Keep last 50 actions to prevent oversized files
-        actions = [
-            {
-                "tool_called": c["tool_called"],
-                "arguments_summary": c.get("args_summary", ""),
-                "result_summary": "",
-            }
-            for c in self.calls[-50:]
-        ]
-
-        try:
-            _engram.save_agent_context(
-                tool=tool,
-                content=content,
-                session_id=self.session_id,
-                project_folder=self.project_folder,
-                actions=actions,
+            client_label = (
+                f"{self.client_info['name']} {self.client_info.get('version', '')}"
+                if self.client_info else ""
             )
-        except Exception as exc:
-            logger.warning("session auto-save failed: %s", exc)
+            content = (
+                f"[MCP 自动记录] 会话时长: {duration} 分钟\n"
+                f"工具调用次数: {len(self.calls)}\n"
+                f"使用的工具: {', '.join(unique_tools)}\n"
+            )
+            if client_label:
+                content += f"MCP 客户端: {client_label}\n"
+
+            # Keep last 50 actions to prevent oversized files
+            actions = [
+                {
+                    "tool_called": c["tool_called"],
+                    "arguments_summary": c.get("args_summary", ""),
+                    "result_summary": "",
+                }
+                for c in self.calls[-50:]
+            ]
+
+            try:
+                _engram.save_agent_context(
+                    tool=tool,
+                    content=content,
+                    session_id=self.session_id,
+                    project_folder=self.project_folder,
+                    actions=actions,
+                )
+            except Exception as exc:
+                logger.warning("session auto-save failed: %s", exc)
 
         # Auto-update project snapshot with current metrics
         if self.project_folder:
@@ -2570,6 +2580,56 @@ async def doctor(output_format: str = "markdown") -> str:
         "detail": "字段级溯源已启用" if has_prov else "无溯源数据（首次 update_profile 后自动生成）",
     })
 
+    # 2.5 R5: Detect if ENGRAM_DIR is inside a cloud-synced or
+    # network-mounted directory. Cloud sync services (iCloud, Dropbox,
+    # OneDrive, Google Drive) can cause corruption when two machines
+    # sync the same JSON files concurrently. NFS/CIFS mounts lack
+    # the atomic rename guarantees that _atomic_write_json relies on.
+    _cloud_markers = {
+        # (path substring, human label)
+        "icloud": "iCloud Drive",
+        "dropbox": "Dropbox",
+        "onedrive": "OneDrive",
+        "google drive": "Google Drive",
+        "googledrive": "Google Drive",
+        # NFS / network markers (Unix mount paths)
+        "/mnt/": "network mount",
+        "/nfs/": "NFS mount",
+        "/smb/": "SMB/CIFS mount",
+    }
+    engram_dir_str = str(_engram.root).replace("\\", "/").lower()
+    cloud_hit = None
+    for marker, label in _cloud_markers.items():
+        if marker in engram_dir_str:
+            cloud_hit = label
+            break
+    # Windows: also check if the drive letter maps to a network path
+    if not cloud_hit and hasattr(os, "name") and os.name == "nt":
+        try:
+            import subprocess
+            drive = str(_engram.root)[:2]  # e.g. "Z:"
+            result = subprocess.run(
+                ["net", "use", drive],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0 and "Remote name" in result.stdout:
+                cloud_hit = f"mapped network drive ({drive})"
+        except Exception:
+            pass
+    checks.append({
+        "name": "storage_location",
+        "status": "WARN" if cloud_hit else "PASS",
+        "detail": (
+            f"ENGRAM_DIR 位于 {cloud_hit} 目录内。"
+            "云同步/NFS 可能导致并发写入冲突和数据损坏。"
+            "建议将 ENGRAM_DIR 设为本地非同步目录。"
+            f" / ENGRAM_DIR is inside a {cloud_hit} directory. "
+            "Concurrent sync may corrupt JSON files."
+        ) if cloud_hit else (
+            f"ENGRAM_DIR={_engram.root} — 本地目录，无云同步风险"
+        ),
+    })
+
     # 3. Knowledge counts
     lessons = _engram.get_lessons(limit=None, _update_access=False)
     decisions = _engram.get_decisions(limit=None, _update_access=False)
@@ -2648,7 +2708,11 @@ async def doctor(output_format: str = "markdown") -> str:
             "status": "WARN",
             "detail": (
                 f"上次会话异常退出 (pid={pid}, last_seen={last_seen}). "
-                "进度可能丢失了 heartbeat 间隔内的内容（默认 5 分钟）。"
+                "进度可能丢失了最近一次 heartbeat checkpoint 之后的内容"
+                "（最多丢失 heartbeat 间隔时间，默认 5 分钟）。"
+                " / Previous session exited uncleanly. Up to one "
+                "heartbeat interval (default 5 min) of progress may "
+                "be lost."
             ),
         })
     else:
@@ -2904,7 +2968,7 @@ async def get_resume_brief(
     + recent context + top lessons/decisions + suggested project docs to
     read. Result is wrapped in ``<engram-resume priority="high">`` so client
     AIs (Claude Code additionalContext, Codex system prompt, etc.) treat
-    it as authoritative.
+    it as high-priority reference context.
 
     Lifecycle: **session start** — call before the first user message in a
     new session when continuing prior work, or whenever the user says

@@ -521,35 +521,45 @@ def _remove_instruction_snippet(tool_id: str) -> bool:
 _HOOK_MODULES = {
     "auto_save_on_stop": "piia_engram.hooks.auto_save_on_stop",
     "auto_inject_resume_brief": "piia_engram.hooks.auto_inject_resume_brief",
+    "auto_absorb_compact": "piia_engram.hooks.auto_absorb_compact",
 }
 
 
 def _quote_for_shell(value: str) -> str:
-    """Cross-platform shell quoting for an absolute file path.
+    """Cross-platform shell quoting for a path or argument.
 
-    Wraps the value in double quotes and escapes any embedded double
-    quote / backslash sequences.  Works in POSIX shells and Windows
-    ``cmd.exe`` (which is the shell Claude Code's hook runner uses —
-    Node.js ``child_process.exec()`` defaults to ``cmd.exe`` on
-    Windows, not PowerShell).
+    **Strategy**: skip quoting entirely when the value has no shell-
+    sensitive characters — an unquoted path works identically in
+    ``cmd.exe``, PowerShell, and POSIX shells.  Only when quoting IS
+    needed (spaces, CJK, ``&``, ``|``, etc.) do we fall back to
+    double-quote wrapping, which is correct for ``cmd.exe`` and POSIX
+    but *not* for PowerShell when used in the executable (first-token)
+    position.
 
-    .. note::
+    **Claude Code hook runner context**: Node.js ``child_process.exec()``
+    defaults to ``cmd.exe`` on Windows, so the double-quote fallback is
+    correct for the hook use-case today.
 
-       If Claude Code ever changes to spawn hooks via PowerShell, the
-       command would need a ``& `` call-operator prefix for quoted
-       executables.  That change would be handled in
-       ``_build_engram_hook_command``, not here.
+    .. warning::
 
-    We deliberately don't pre-mangle backslashes the way the old code
-    did — ``json.dumps`` later escapes the resulting string for JSON,
-    and shells receive the original separators unchanged. That fixes the
-    "double-escape on Windows / mixed quoting on macOS" bug from H2.
+       **PowerShell limitation (H2)**: If the executable path contains
+       spaces, the generated command ``"C:\\Program Files\\...\\python.exe"
+       -m module`` will fail in PowerShell because PS treats a quoted
+       first token as a string expression, not a command invocation.
+       PowerShell requires ``& "path" -m module``.  This is NOT a
+       problem for Claude Code hooks (cmd.exe), but would break if a
+       future hook runner switches to PowerShell.  In that case,
+       ``_build_engram_hook_command`` should prefix ``& `` on Windows.
     """
     if not value:
         return '""'
-    # Backslash-escape any embedded backslash followed by a quote, then
-    # the quotes themselves. This is the canonical Windows quoting rule
-    # and is also accepted by POSIX shells.
+    # Fast path: no quoting needed — works in ALL shells including
+    # PowerShell.  Covers the common case of paths without spaces
+    # (e.g. "E:/codex-runtimes/.../python.exe").
+    _SHELL_SENSITIVE = set(' \t"&|<>()^!%')
+    if not any(c in _SHELL_SENSITIVE for c in value):
+        return value
+    # Slow path: must quote.  Use double quotes (cmd.exe + POSIX).
     out = value.replace('"', '\\"')
     return f'"{out}"'
 
@@ -738,6 +748,38 @@ def _inject_claude_code_sessionstart_hook(python_path: str) -> str | None:
         # Marking the hook async lets the first turn start before the
         # brief is written, defeating the whole point of mechanism (6).
         async_hook=False,
+    )
+
+
+def _inject_claude_code_postcompact_hook(python_path: str) -> str | None:
+    """v3.30 mechanism (R4): register PostCompact hook to absorb compact summary.
+
+    Fires AFTER Claude Code compacts the transcript. The hook script
+    reads the compacted transcript, extracts the AI-generated summary
+    from its head, and appends it to the per-project daily log as a
+    "compact" event. Also feeds the summary into extract_session_insights
+    for staging-tier auto-extraction.
+
+    This replaces the earlier agent-type PostCompact hook (PKC era) with
+    a lightweight command-type hook that doesn't spin up a full AI
+    conversation just to extract knowledge from a summary.
+
+    Sets ``CLAUDE_INVOKED_BY=engram_postcompact`` for recursion guard.
+    """
+    return _inject_claude_code_hook_for_event(
+        python_path,
+        event="PostCompact",
+        module=_HOOK_MODULES["auto_absorb_compact"],
+        status_message="Engram 压缩摘要吸收中...",
+        timeout=30,
+        extra_env={
+            "CLAUDE_INVOKED_BY": "engram_postcompact",
+        },
+        marker_keywords=(
+            "auto_absorb_compact",
+            "piia_engram.hooks.auto_absorb_compact",
+        ),
+        async_hook=True,
     )
 
 
@@ -1800,6 +1842,11 @@ def run_setup(advanced: bool = False) -> None:
             if ss_result:
                 print(_t(f"  🔗 已注册 SessionStart 接续简报 Hook（v3.30）",
                          f"  🔗 Registered SessionStart resume-brief hook (v3.30)"))
+            # v3.30 R4: PostCompact hook — absorb compact summary into daily log.
+            pc_result = _inject_claude_code_postcompact_hook(python_path)
+            if pc_result:
+                print(_t(f"  🔗 已注册 PostCompact 摘要吸收 Hook（v3.30）",
+                         f"  🔗 Registered PostCompact summary-absorb hook (v3.30)"))
     print()
 
     # Step 2 — 录入身份信息
@@ -2337,18 +2384,26 @@ def _run_functional_checks(*, fix: bool = False) -> int:
             settings = {}
 
     hook_specs = (
-        # (event, human label, markers, injector, doctor flag)
+        # (event, human label, markers, match_mode, injector)
+        # match_mode: "any" = any marker hit → ok (Stop, SessionStart)
+        #             "all" = ALL markers must hit → ok (PreCompact)
         (
             "Stop",
             "Stop",
             ("auto_save_on_stop", "piia_engram.hooks.auto_save_on_stop"),
+            "any",
             _inject_claude_code_hook,
         ),
         (
             "PreCompact",
             "PreCompact",
+            # M3 fix: require BOTH the module AND the env marker.
+            # A hook with just the module name (no CLAUDE_INVOKED_BY=
+            # engram_precompact) is a misconfigured Stop-style hook that
+            # would use the wrong flush threshold.
             ("CLAUDE_INVOKED_BY=engram_precompact",
              "piia_engram.hooks.auto_save_on_stop"),
+            "all",
             _inject_claude_code_precompact_hook,
         ),
         (
@@ -2356,17 +2411,27 @@ def _run_functional_checks(*, fix: bool = False) -> int:
             "SessionStart (resume brief inject)",
             ("auto_inject_resume_brief",
              "piia_engram.hooks.auto_inject_resume_brief"),
+            "any",
             _inject_claude_code_sessionstart_hook,
+        ),
+        (
+            "PostCompact",
+            "PostCompact (summary absorb)",
+            ("auto_absorb_compact",
+             "piia_engram.hooks.auto_absorb_compact"),
+            "any",
+            _inject_claude_code_postcompact_hook,
         ),
     )
 
     python_path_for_fix: str | None = None
-    for event, label, markers, injector in hook_specs:
+    for event, label, markers, match_mode, injector in hook_specs:
         found = False
+        matcher = all if match_mode == "all" else any
         for event_group in settings.get("hooks", {}).get(event, []):
             for hook in event_group.get("hooks", []):
                 cmd = hook.get("command", "")
-                if any(m in cmd for m in markers):
+                if matcher(m in cmd for m in markers):
                     found = True
                     break
             if found:

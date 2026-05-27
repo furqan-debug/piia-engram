@@ -171,7 +171,7 @@
     {
       "name": "V4.6 quick_context file",
       "status": "PASS",
-      "detail": "path=C:\\Users\\pp3x3\\.engram\\quick_context.md; len=2205",
+      "detail": "path=C:\\Users\\<USER>\\.engram\\quick_context.md; len=2205",
       "data": null
     },
     {

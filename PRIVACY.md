@@ -49,7 +49,7 @@ All files are plain JSON. You can open, edit, back up, or delete them at any tim
 
 ### Core tools: zero network requests
 
-All 61 MCP tools (identity, knowledge, search, review, etc.) operate entirely on local files. They make **no network requests** — no API calls, no analytics, no phone-home.
+All 65 MCP tools (identity, knowledge, search, review, etc.) operate entirely on local files. They make **no network requests** — no API calls, no analytics, no phone-home.
 
 The only exception is the optional `read_web_content` tool, which fetches a URL you explicitly provide.
 

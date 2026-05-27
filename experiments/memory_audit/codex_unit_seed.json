@@ -106,11 +106,11 @@
     },
     "W4.1": {
       "session_id": "2026-05-27T01-23-57",
-      "file": "C:\\Users\\pp3x3\\.engram\\contexts\\codex\\2026-05-27T01-23-57.md",
+      "file": "C:\\Users\\<USER>\\.engram\\contexts\\codex\\2026-05-27T01-23-57.md",
       "content": "Codex单测跨执行验证：写入于 2026-05-27T01:23:57.564798"
     },
     "W4.2": {
-      "path": "C:\\Users\\pp3x3\\.engram\\quick_context.md"
+      "path": "C:\\Users\\<USER>\\.engram\\quick_context.md"
     },
     "W5.1": {
       "summary": "Codex单测：完成了异步修复，发现嵌套事件循环问题。决定统一用asyncio.run。",
@@ -138,7 +138,7 @@
         },
         "context": {
           "session_id": "2026-05-27T01-23-57",
-          "file": "C:\\Users\\pp3x3\\.engram\\contexts\\codex\\2026-05-27T01-23-57.md",
+          "file": "C:\\Users\\<USER>\\.engram\\contexts\\codex\\2026-05-27T01-23-57.md",
           "tool": "codex",
           "appended": true
         },
@@ -417,16 +417,16 @@
         "detail": "session_id=2026-05-27T01-23-57",
         "data": {
           "session_id": "2026-05-27T01-23-57",
-          "file": "C:\\Users\\pp3x3\\.engram\\contexts\\codex\\2026-05-27T01-23-57.md",
+          "file": "C:\\Users\\<USER>\\.engram\\contexts\\codex\\2026-05-27T01-23-57.md",
           "content": "Codex单测跨执行验证：写入于 2026-05-27T01:23:57.564798"
         }
       },
       {
         "name": "W4.2 refresh_quick_context",
         "status": "PASS",
-        "detail": "path=C:\\Users\\pp3x3\\.engram\\quick_context.md",
+        "detail": "path=C:\\Users\\<USER>\\.engram\\quick_context.md",
         "data": {
-          "path": "C:\\Users\\pp3x3\\.engram\\quick_context.md"
+          "path": "C:\\Users\\<USER>\\.engram\\quick_context.md"
         }
       },
       {
@@ -459,7 +459,7 @@
             },
             "context": {
               "session_id": "2026-05-27T01-23-57",
-              "file": "C:\\Users\\pp3x3\\.engram\\contexts\\codex\\2026-05-27T01-23-57.md",
+              "file": "C:\\Users\\<USER>\\.engram\\contexts\\codex\\2026-05-27T01-23-57.md",
               "tool": "codex",
               "appended": true
             },

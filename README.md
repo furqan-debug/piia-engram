@@ -336,7 +336,7 @@ ENGRAM_AUTH_TOKEN=abc123... python -m piia_engram.mcp_server --transport sse --h
 
 ## MCP Tools
 
-piia-engram ships 61 MCP tools. By default, only the 13 **Tier-1 Core** tools are loaded to keep the AI's context clean. To unlock all 61 tools, add `ENGRAM_TOOLS=all` to your MCP config:
+piia-engram ships 65 MCP tools. By default, only the 16 **Tier-1 Core** tools are loaded to keep the AI's context clean. To unlock all 65 tools, add `ENGRAM_TOOLS=all` to your MCP config:
 
 ```json
 {

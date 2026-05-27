@@ -69,7 +69,7 @@ Tools that store the **user's** identity, preferences, and accumulated knowledge
 
 *\* monorepo star count; individual memory server is one of many packages*
 
-**This is where piia-engram lives.** No other project in this category uses staging → verified as a default governance model. The closest are Remnic (provenance/correction) and Vestige (contradiction/audit).
+**This is where piia-engram lives.** Among the projects we've surveyed, piia-engram is the only one using staging → verified as the *default* governance model. The closest approaches are Remnic (provenance/correction) and Vestige (contradiction/audit).
 
 ---
 

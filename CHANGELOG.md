@@ -4,6 +4,55 @@ All notable changes to Engram are documented in this file. For detailed release 
 
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semantic Versioning](https://semver.org/).
 
+## [3.30.0] - 2026-05-27
+
+跨会话 / 跨工具续接 + 崩溃恢复"六件套"全套机制 + 多轮源码审查驱动的 HIGH/MEDIUM 修复。
+
+### Added — 六件套机制
+- **机制 (1) Audit log 默认开启 + 启动恢复检测**：替代之前讨论过的 WAL 设计，更轻量。
+- **机制 (2) 时间 heartbeat snapshot**：默认 5 分钟保存一次会话状态（可配置 `ENGRAM_HEARTBEAT_INTERVAL`），长会话崩溃也只丢 5 分钟。
+- **机制 (3) `get_resume_brief` MCP 工具**：返回身份卡 + 项目快照 + daily log + 最近 lessons/decisions 的合并简报，1500 token 预算。
+- **机制 (4) PreCompact hook 不对称阈值 + 防递归**：Stop hook MIN_TURNS=10、PreCompact MIN_TURNS=5；通过 `CLAUDE_INVOKED_BY=engram_*` 防止 Claude Agent SDK 子进程触发递归。
+- **机制 (5) Daily log 层**：`~/.engram/projects/<hash>/daily/YYYY-MM-DD.md` 按项目按天的人类可读时间线，event_type 区分 session/lesson/decision/compact/checkpoint。
+- **机制 (6) SessionStart hook 自动注入 resume brief**："最后一公里"——通过 `hookSpecificOutput.additionalContext` 协议把简报塞进首轮系统 prompt，用户零操作即获接续上下文。
+
+### Added — R4 PostCompact 摘要吸收
+- **`auto_absorb_compact.py` hook**：Claude Code 压缩对话后触发，从压缩后 transcript 头部提取 ≥200 字符的 compact summary，存入 daily log（event_type=`compact`），并 best-effort 调用 `extract_session_insights` 自动提取 staging 知识。
+- 摘要超过 3000 字符自动截断；完整递归防护；setup 与 doctor 都已注册。
+
+### Added — 新 MCP 工具
+- `get_resume_brief(project_folder, token_budget)` — 跨工具/跨会话续接简报，Tier-1 核心。
+- `get_daily_log(project_folder, date)` — 读取项目某天的时间线，Tier-1 核心。
+- 工具总数从 v3.29.4 的 61 增加到 65（Tier-1 16 个 / Tier-2 49 个）。
+
+### Added — Doctor 增强
+- 检查 4 个 Claude Code hook（Stop / PreCompact / SessionStart / PostCompact），`engram doctor --fix` 可自动注册缺失项。
+- **R5 云同步目录检测**：识别 ENGRAM_DIR 是否位于 iCloud / Dropbox / OneDrive / Google Drive / NFS / SMB 挂载，给出 WARN（这些目录的并发写可能损坏 portalocker 锁与 JSONL 一致性）。
+
+### Fixed — 五方审查 HIGH/MEDIUM 项
+- **H1**：`save_agent_context` nonce 比较从相等改为"两边都非空"判断，修复磁盘空 nonce 导致的合并错误。
+- **H2**：`_quote_for_shell` 改为"无 shell 敏感字符则不引号"策略，让生成的命令在 cmd.exe 和 PowerShell 中都能运行；带空格的路径仍正确加引号（PowerShell 限制写进了 docstring）。
+- **M1**：`_daily_log_path` 不再二次映射空 `project_folder`，避免与 `_project_id()` 的 hash 不一致。
+- **M2**：`auto_save()` 最终保存路径用 `self._lock` 串行化，避免与残留 heartbeat 线程竞态。
+- **M3**：doctor PreCompact hook 检查现在要求 module 名 **和** `CLAUDE_INVOKED_BY=engram_precompact` env 标记**都**存在（"all" 模式），半坏的 hook 不再被误判为 ok。
+- **M4**：`_heartbeat_tick` docstring 改为"attempted save"语义，与返回值一致。
+- **M5**：README/PRIVACY/测试中的工具数从 61 同步到 65，并补齐 Tier-1 表格。
+- **R1**：resume brief 表述从 "authoritative context" 改为 "reference context"——避免诱导 prompt injection。
+- **R2**：comparison.md "No other project does X" 绝对化措辞改为 "Among the projects we've surveyed, piia-engram is the only one using"——可证伪表述。
+- **R3**：`doctor unclean_exit` 警告增加 blast radius 细节（"最多丢失最近 5 分钟"）。
+- **R6**：`_quote_for_shell` PowerShell 限制以 `.. warning::` 注释形式写进 docstring。
+
+### Changed
+- `_HOOK_MODULES` 现在包含 4 个模块：`auto_save_on_stop` / `auto_inject_resume_brief` / `auto_absorb_compact`（原本只有前两个）。
+- Hook 注册器 `_inject_claude_code_hook_for_event` 抽出为通用核心，被 Stop/PreCompact/SessionStart/PostCompact 共用。
+- Doctor `hook_specs` 引入 `match_mode`（"any" / "all"），区别于宽松匹配与严格匹配。
+- README/README.zh-CN 同步工具计数与 Tier-1 表格，新增 Remote Deployment 章节。
+- 发布前脱敏清理（竞品名、核心技术、API key、账号密码）正式纳入发布流程文档。
+
+### Release Evidence
+- 全量 pytest：930/930 通过（v3.29.4 是 892）。
+- 五方源码审查：DeepSeek + Codex + Opus + Claude + ChatGPT Pro 综合报告，HIGH/MEDIUM 项全数闭环。
+
 ## [3.29.4] - 2026-05-27
 
 跨工具/跨会话审计驱动的优化版本。R1/R2/R3 三轮回归全部通过。

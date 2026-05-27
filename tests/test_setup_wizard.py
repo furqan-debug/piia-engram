@@ -1805,10 +1805,26 @@ class TestEngramHookCommandConstruction:
             },
         )
         assert "--env" in cmd
-        assert '"ENGRAM_MIN_TURNS_TO_FLUSH=5"' in cmd
-        assert '"CLAUDE_INVOKED_BY=engram_precompact"' in cmd
+        # Values without shell-sensitive chars are unquoted (H2 fix);
+        # values with spaces/special chars would be quoted.
+        assert "ENGRAM_MIN_TURNS_TO_FLUSH=5" in cmd
+        assert "CLAUDE_INVOKED_BY=engram_precompact" in cmd
         # No POSIX-only inline env prefix.
         assert not cmd.startswith("ENGRAM_MIN_TURNS")
+
+    def test_quote_for_shell_skips_clean_paths(self):
+        """H2 fix: paths without shell-sensitive chars are unquoted,
+        making them work in both cmd.exe and PowerShell."""
+        from piia_engram.setup_wizard import _quote_for_shell
+        # No spaces → unquoted
+        assert _quote_for_shell("/usr/bin/python3") == "/usr/bin/python3"
+        assert _quote_for_shell(r"E:\codex\python.exe") == r"E:\codex\python.exe"
+        # Spaces → quoted (cmd.exe style)
+        assert _quote_for_shell(r"C:\Program Files\python.exe") == r'"C:\Program Files\python.exe"'
+        # Empty → empty quotes
+        assert _quote_for_shell("") == '""'
+        # Special chars → quoted
+        assert _quote_for_shell("path&name") == '"path&name"'
 
     def test_sessionstart_hook_registered_synchronously(self, tmp_path, monkeypatch):
         """H3: SessionStart must be a synchronous hook — otherwise the
@@ -1852,6 +1868,40 @@ class TestEngramHookCommandConstruction:
         )
         hook = settings["hooks"]["Stop"][0]["hooks"][0]
         assert hook.get("async") is True
+
+    def test_postcompact_hook_registered_async(self, tmp_path, monkeypatch):
+        """R4: PostCompact is fire-and-forget (async=True)."""
+        import sys as _sys
+        from piia_engram.setup_wizard import _inject_claude_code_postcompact_hook
+        monkeypatch.setattr("piia_engram.setup_wizard.Path.home", lambda: tmp_path)
+        (tmp_path / ".claude").mkdir()
+
+        result = _inject_claude_code_postcompact_hook(_sys.executable)
+        assert result is not None
+
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+        hooks = settings["hooks"]["PostCompact"][0]["hooks"]
+        engram_hook = [
+            h for h in hooks
+            if "auto_absorb_compact" in h.get("command", "")
+        ]
+        assert len(engram_hook) == 1
+        assert engram_hook[0].get("async") is True
+        assert "CLAUDE_INVOKED_BY=engram_postcompact" in engram_hook[0]["command"]
+
+    def test_postcompact_hook_idempotent(self, tmp_path, monkeypatch):
+        """R4: PostCompact hook is idempotent — second call returns None."""
+        import sys as _sys
+        from piia_engram.setup_wizard import _inject_claude_code_postcompact_hook
+        monkeypatch.setattr("piia_engram.setup_wizard.Path.home", lambda: tmp_path)
+        (tmp_path / ".claude").mkdir()
+
+        first = _inject_claude_code_postcompact_hook(_sys.executable)
+        assert first is not None
+        second = _inject_claude_code_postcompact_hook(_sys.executable)
+        assert second is None
 
 
 # ---------------------------------------------------------------------------
